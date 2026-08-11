@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import datetime
 from functools import lru_cache
 from typing import Any
 
@@ -13,6 +14,26 @@ PHASES = ("ETWT", "NTST", "ELWL", "NLSL")
 MOVEMENTS = {"ETWT": ("ET", "WT"), "NTST": ("NT", "ST"), "ELWL": ("EL", "WL"), "NLSL": ("NL", "SL")}
 TAU = 300.0
 P_MAX = 0.3
+
+
+def _write_reward_log(record: dict[str, Any]) -> None:
+    """Append one complete reward audit record; safe for concurrent workers."""
+    path = os.environ.get("V35_GRPO_REWARD_LOG", "")
+    if not path:
+        return
+    record = dict(record)
+    record["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    record["pid"] = os.getpid()
+    try:
+        payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+    except OSError:
+        # Reward logging must never interrupt training.
+        pass
 
 
 def _json(value: Any) -> Any:
@@ -30,6 +51,13 @@ def _tag(text: str, name: str) -> list[str]:
     return re.findall(rf"<{name}>\s*(.*?)\s*</{name}>", text or "", flags=re.I | re.S)
 
 
+def _has_exact_tag_pair(text: str, name: str) -> bool:
+    return (
+        len(re.findall(rf"<{name}>", text or "", flags=re.I)) == 1
+        and len(re.findall(rf"</{name}>", text or "", flags=re.I)) == 1
+    )
+
+
 def _phase_map(perception: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(perception, dict):
         return {}
@@ -41,35 +69,76 @@ def _phase_map(perception: Any) -> dict[str, dict[str, Any]]:
     return {}
 
 
+def _valid_phase_row(row: Any, phase: str) -> bool:
+    """Validate one perception row without raising on malformed model output."""
+    if not isinstance(row, dict):
+        return False
+
+    current_v = row.get("current_v")
+    current_q = row.get("current_q")
+    coordinated = row.get("coordinated_arrivals")
+    if not all(isinstance(group, dict) for group in (current_v, current_q, coordinated)):
+        return False
+    if not all(isinstance(group.get("total"), (int, float)) for group in (current_v, current_q, coordinated)):
+        return False
+    if not isinstance(row.get("nonzero_v_history_length_since_last_service"), (int, float)):
+        return False
+    if not isinstance(row.get("demand_trend_v30_minus_v5"), (int, float)):
+        return False
+    if not isinstance(row.get("queue_trend_q30_minus_q5"), (int, float)):
+        return False
+
+    movements = MOVEMENTS[phase]
+    if not all(isinstance(current_v.get(movement), (int, float)) for movement in movements):
+        return False
+    if not all(isinstance(current_q.get(movement), (int, float)) for movement in movements):
+        return False
+    if current_v["total"] != sum(current_v[movement] for movement in movements):
+        return False
+    if current_q["total"] != sum(current_q[movement] for movement in movements):
+        return False
+    if not 0 <= current_q["total"] <= current_v["total"]:
+        return False
+    return coordinated["total"] >= 0
+
+
 def _format(solution: str) -> tuple[bool, bool, dict[str, Any]]:
     names = ("perception", "mode", "reasoning", "current_v", "signal")
     blocks = {n: _tag(solution, n) for n in names}
-    signal_bad = len(blocks["signal"]) != 1 or blocks["signal"][0].strip() not in PHASES
-    positions = [solution.lower().find(f"<{n}>") for n in ("perception", "mode", "current_v", "signal")]
-    order = all(x >= 0 for x in positions) and positions == sorted(positions)
-    if not order or any(len(blocks[n]) != 1 for n in ("perception", "mode", "current_v", "signal")):
+    required = ("perception", "mode", "current_v", "signal")
+    signal_bad = (
+        len(blocks["signal"]) != 1
+        or not _has_exact_tag_pair(solution, "signal")
+        or blocks["signal"][0].strip() not in PHASES
+    )
+    if any(len(blocks[name]) != 1 or not _has_exact_tag_pair(solution, name) for name in required):
         return False, signal_bad, {}
     mode = blocks["mode"][0].strip().lower()
+    expected_order = ("perception", "mode", "current_v", "signal") if mode == "fast" else (
+        "perception", "mode", "reasoning", "current_v", "signal"
+    )
+    positions = [solution.lower().find(f"<{name}>") for name in expected_order]
+    order = all(position >= 0 for position in positions) and positions == sorted(positions)
+    reasoning_contract = (
+        mode == "fast" and not blocks["reasoning"] and not re.search(r"</?reasoning>", solution, flags=re.I)
+    ) or (
+        mode == "slow"
+        and len(blocks["reasoning"]) == 1
+        and _has_exact_tag_pair(solution, "reasoning")
+        and bool(blocks["reasoning"][0].strip())
+    )
+    if not order or not reasoning_contract:
+        return False, signal_bad, {}
     perception = _json(blocks["perception"][0])
     current_v = _json(blocks["current_v"][0])
     phases = _phase_map(perception)
     valid = mode in ("fast", "slow") and isinstance(current_v, dict) and set(current_v) == set(PHASES) and len(phases) == 4
-    for phase in PHASES:
-        row = phases.get(phase, {})
-        for group in ("current_v", "current_q", "coordinated_arrivals"):
-            valid &= isinstance(row.get(group), dict) and isinstance(row[group].get("total"), (int, float))
-        valid &= isinstance(row.get("nonzero_v_history_length_since_last_service"), (int, float))
-        valid &= isinstance(row.get("demand_trend_v30_minus_v5"), (int, float))
-        valid &= isinstance(row.get("queue_trend_q30_minus_q5"), (int, float))
-        valid &= all(isinstance(row.get("current_v", {}).get(m), (int, float)) for m in MOVEMENTS[phase])
-        valid &= all(isinstance(row.get("current_q", {}).get(m), (int, float)) for m in MOVEMENTS[phase])
-        valid &= row.get("current_v", {}).get("total") == sum(row.get("current_v", {}).get(m, 0) for m in MOVEMENTS[phase])
-        valid &= row.get("current_q", {}).get("total") == sum(row.get("current_q", {}).get(m, 0) for m in MOVEMENTS[phase])
-        valid &= 0 <= row.get("current_q", {}).get("total", -1) <= row.get("current_v", {}).get("total", -1)
-        valid &= row.get("coordinated_arrivals", {}).get("total", -1) >= 0
-    valid &= all(isinstance(current_v[p], int) and current_v[p] >= 0 for p in PHASES)
-    valid &= all(current_v[p] == phases[p].get("current_v", {}).get("total") for p in PHASES)
-    valid &= (mode == "fast" and len(blocks["reasoning"]) == 0) or (mode == "slow" and len(blocks["reasoning"]) == 1 and bool(blocks["reasoning"][0].strip()))
+    if valid:
+        valid = all(_valid_phase_row(phases.get(phase), phase) for phase in PHASES)
+    if valid:
+        valid = all(isinstance(current_v[phase], int) and current_v[phase] >= 0 for phase in PHASES)
+    if valid:
+        valid = all(current_v[phase] == phases[phase]["current_v"]["total"] for phase in PHASES)
     return bool(valid), signal_bad, {"mode": mode, "signal": blocks["signal"][0].strip(), "perception": perception, "current_v": current_v, "reasoning": blocks["reasoning"][0] if blocks["reasoning"] else ""}
 
 
@@ -95,11 +164,48 @@ def _traffic(ground_truth: dict[str, Any], signal: str) -> float:
     actions = ground_truth.get("actions", {})
     if set(actions) != set(PHASES):
         return 0.0
+    candidate = actions.get(signal, {})
+    if all(isinstance(candidate.get(k), (int, float)) for k in ("queue_score", "volume_score", "discharge_score")):
+        return (
+            float(candidate["queue_score"])
+            + float(candidate["volume_score"])
+            + float(candidate["discharge_score"])
+        ) / 3.0
     values = {k: {m: float(actions[k].get(m, 0.0)) for m in ("remaining_v_30s", "remaining_queue_30s", "discharged_30s")} for k in PHASES}
     v = _rank_scores({p: x["remaining_v_30s"] for p, x in values.items()}, False)
     q = _rank_scores({p: x["remaining_queue_30s"] for p, x in values.items()}, False)
     d = _rank_scores({p: x["discharged_30s"] for p, x in values.items()}, True)
     return (v[signal] + q[signal] + d[signal]) / 3.0
+
+
+def _perception_values(value: Any) -> list[float]:
+    """Flatten the 11 scored values for each of the four phase rows (44 total).
+
+    ``is_boundary`` is intentionally excluded.  The two movement entries in
+    each current_v/current_q group and the two movement counts in
+    coordinated_arrivals are the two breakdown values for that phase.
+    """
+    phases = _phase_map(value)
+    if len(phases) != 4:
+        return []
+    result: list[float] = []
+    for phase in PHASES:
+        row = phases.get(phase)
+        if not isinstance(row, dict):
+            return []
+        try:
+            movements = MOVEMENTS[phase]
+            current_v = row["current_v"]
+            current_q = row["current_q"]
+            arrivals = row["coordinated_arrivals"]
+            result.extend([float(current_v["total"]), *(float(current_v[m]) for m in movements)])
+            result.extend([float(current_q["total"]), *(float(current_q[m]) for m in movements)])
+            result.extend([float(row["demand_trend_v30_minus_v5"]), float(row["queue_trend_q30_minus_q5"])])
+            breakdown = arrivals["breakdown"]
+            result.extend([float(arrivals["total"]), *(float(breakdown[m]["count"]) for m in movements)])
+        except (KeyError, TypeError, ValueError):
+            return []
+    return result
 
 
 @lru_cache(maxsize=1)
@@ -111,26 +217,65 @@ def _tokenizer():
 
 def compute_score(solution_str, ground_truth, **kwargs):
     gt = _json(ground_truth) or {}
-    parsed, signal_bad, output = _format(solution_str or "")
-    if signal_bad:
-        return -1.0
-    if not parsed:
-        return 0.0
-    target = gt.get("perception_target", {})
-    correct = 0
-    for phase in PHASES:
-        predicted = output["perception"]["candidate_phases"] if isinstance(output["perception"], dict) and isinstance(output["perception"].get("candidate_phases"), list) else output["perception"]
-        row = next((r for r in predicted if r.get("signal") == phase), None) if isinstance(predicted, list) else predicted.get(phase)
-        value = row.get("current_v", {}).get("total") if isinstance(row, dict) else None
-        final = output["current_v"].get(phase)
-        if isinstance(value, (int, float)) and isinstance(final, (int, float)) and abs(value - target.get(phase, 10**9)) <= 1 and abs(final - target.get(phase, 10**9)) <= 1:
-            correct += 1
-    perception_reward = correct / 4.0
-    traffic_reward = _traffic(gt, output["signal"])
-    try:
-        length = len(_tokenizer()(output["reasoning"], add_special_tokens=False)["input_ids"])
-    except Exception:
-        length = len(output["reasoning"].split())
-    reasoning_penalty = 0.0 if output["mode"] == "fast" else P_MAX * (1.0 - math.exp(-length / TAU))
-    return traffic_reward + 0.5 * perception_reward - reasoning_penalty
+    solution = solution_str or ""
+    extra_info = kwargs.get("extra_info") or {}
+    split = extra_info.get("split", "unknown") if isinstance(extra_info, dict) else "unknown"
+    sample_id = extra_info.get("index") if isinstance(extra_info, dict) else None
+    parsed, signal_bad, output = _format(solution)
+    mode_blocks = _tag(solution, "mode")
+    reasoning_blocks = _tag(solution, "reasoning")
+    mode = mode_blocks[0].strip().lower() if len(mode_blocks) == 1 else ""
+    reasoning = reasoning_blocks[0] if len(reasoning_blocks) == 1 else ""
+    if mode == "slow":
+        try:
+            length = len(_tokenizer()(reasoning, add_special_tokens=False)["input_ids"])
+        except Exception:
+            length = len(reasoning.split())
+        reasoning_penalty = P_MAX * (1.0 - math.exp(-length / TAU))
+    else:
+        reasoning_penalty = 0.0
 
+    if signal_bad:
+        result = {
+            "score": -1.0,
+            "format_reward": 0.0,
+            "traffic_reward": 0.0,
+            "perception_reward": 0.0,
+            "reasoning_penalty": reasoning_penalty,
+        }
+        _write_reward_log({"split": split, "sample_id": sample_id, "solution": solution,
+                           "ground_truth": gt, **result})
+        return result
+
+    if not parsed:
+        perception_blocks = _tag(solution, "perception")
+        current_v_blocks = _tag(solution, "current_v")
+        signal_blocks = _tag(solution, "signal")
+        output = {
+            "mode": mode,
+            "signal": signal_blocks[0].strip(),
+            "perception": _json(perception_blocks[0]) if len(perception_blocks) == 1 else {},
+            "current_v": _json(current_v_blocks[0]) if len(current_v_blocks) == 1 else {},
+            "reasoning": reasoning,
+        }
+
+    format_reward = 1.0 if parsed else 0.0
+    predicted_values = _perception_values(output.get("perception"))
+    target_values = _perception_values(gt.get("perception_target"))
+    correct = sum(abs(pred - target) <= 1 for pred, target in zip(predicted_values, target_values))
+    perception_reward = correct / 44.0 if len(predicted_values) == 44 and len(target_values) == 44 else 0.0
+    traffic_reward = _traffic(gt, output["signal"])
+    score = format_reward * (traffic_reward + 0.5 * perception_reward) - reasoning_penalty
+    result = {
+        "score": score,
+        "format_reward": format_reward,
+        "traffic_reward": traffic_reward,
+        "perception_reward": perception_reward,
+        "reasoning_penalty": reasoning_penalty,
+        "perception_correct": correct,
+        "perception_total": 44,
+    }
+    _write_reward_log({"split": split, "sample_id": sample_id, "solution": solution,
+                       "ground_truth": gt, "parsed": parsed, "mode": output.get("mode"),
+                       "signal": output.get("signal"), **result})
+    return result

@@ -31,6 +31,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -112,10 +113,14 @@ class AgentLoopOutput(BaseModel):
     """Extra fields for dynamic addition."""
     mm_processor_kwargs: Optional[dict[str, Any]] = None
     """Processor/backend kwargs that must stay aligned across rollout and training paths."""
+    processor_prompt: Optional[str] = None
+    """Unexpanded multimodal chat-template text used to build ``prompt_ids``."""
 
     def as_dict(self) -> dict[str, Any]:
         """Convert agent loop output to a dictionary."""
         output = self.model_dump(exclude_unset=True)
+        # Used only while reward-time multimodal features are reconstructed.
+        output.pop("processor_prompt", None)
 
         output["prompts"] = torch.tensor(output.pop("prompt_ids"), dtype=torch.int64)
         output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
@@ -887,7 +892,29 @@ class AgentLoopWorker:
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
-        current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
+        # Keep Qwen vision boundary/pad tokens when rebuilding processor
+        # inputs for reward-time RoPE calculation. Dropping them makes
+        # video_grid_thw and the video token stream disagree, which causes
+        # Qwen3.5's get_rope_index() to raise StopIteration.
+        # Reuse the original, unexpanded chat-template text whenever it is
+        # available. Processor-produced prompt IDs contain one vision-pad token
+        # per visual patch and are not losslessly invertible to media
+        # placeholders. Re-processing their decoded form can therefore make the
+        # number of placeholders disagree with video_metadata.
+        current_text = output.processor_prompt
+        if current_text is None:
+            # Compatibility path for third-party/multi-turn agent loops which do
+            # not yet preserve the source template. Do not include generated
+            # response tokens: they are never multimedia input.
+            current_text = self.tokenizer.decode(output.prompt_ids, skip_special_tokens=False)
+            for token_name in ("image", "video"):
+                token = getattr(self.processor, f"{token_name}_token", None)
+                if token is None:
+                    token_id = get_processor_token_id(self.processor, token_name)
+                    if token_id is not None:
+                        token = self.tokenizer.convert_ids_to_tokens(token_id)
+                if token:
+                    current_text = re.sub(rf"(?:{re.escape(token)})+", token, current_text)
 
         multi_modal_inputs = build_multimodal_processor_inputs(
             self.processor,
@@ -923,9 +950,40 @@ class AgentLoopWorker:
         if self.processor is None or not hasattr(self.processor, "get_rope_index"):
             return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
 
+        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+        video_grid_thw = multi_modal_inputs.get("video_grid_thw")
+
+        # Backport Hugging Face transformers PR #44472 for the unmerged
+        # Qwen3VL per-frame-video M-RoPE bug. Qwen3VL's processor inserts one
+        # visual segment per frame but keeps video_grid_thw as one [T,H,W] row
+        # per video. get_rope_index consumes one row per segment, so expand the
+        # grid to [1,H,W] rows only for this RoPE calculation. The original
+        # grid remains untouched for the vision encoder.
+        if (
+            video_grid_thw is not None
+            and self.processor.__class__.__name__ == "Qwen3VLProcessor"
+        ):
+            expanded_video_grid = torch.cat(
+                [thw[1:].unsqueeze(0).expand(int(thw[0].item()), -1) for thw in video_grid_thw],
+                dim=0,
+            )
+            video_grid_for_rope = torch.cat(
+                [
+                    torch.ones(
+                        (expanded_video_grid.shape[0], 1),
+                        dtype=video_grid_thw.dtype,
+                        device=video_grid_thw.device,
+                    ),
+                    expanded_video_grid,
+                ],
+                dim=1,
+            )
+        else:
+            video_grid_for_rope = video_grid_thw
+
         multi_modal_kwargs = {
-            "image_grid_thw": multi_modal_inputs.get("image_grid_thw"),
-            "video_grid_thw": multi_modal_inputs.get("video_grid_thw"),
+            "image_grid_thw": image_grid_thw,
+            "video_grid_thw": video_grid_for_rope,
         }
         # For transformers>=5.3.0, mm_token_type_ids is only used to calculate position ids.
         if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
@@ -943,7 +1001,7 @@ class AgentLoopWorker:
         if get_rope_index_kwargs is not None:
             multi_modal_kwargs.update(get_rope_index_kwargs(multi_modal_inputs))
 
-        # Model's get_rope_index has been dynamically bind to the processor.
+        # Model's get_rope_index has been dynamically bound to the processor.
         vision_position_ids, _ = self.processor.get_rope_index(
             input_ids=input_ids,
             attention_mask=attention_mask,

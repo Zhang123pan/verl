@@ -19,6 +19,7 @@ from uuid import uuid4
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.tokenizer.chat_template import apply_chat_template
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -51,7 +52,21 @@ class SingleTurnAgentLoop(AgentLoopBase):
         use_continuous_token = self.enable_continuous_token and not multi_modal_data
         if use_continuous_token:
             prompt_ids = await self.ct_build_initial_tokens(messages)
+            processor_prompt = None
         else:
+            # Preserve the exact pre-processor template. Reward-time multimodal
+            # processing must start from these one-per-media placeholders, rather
+            # than decoding the patch-expanded prompt IDs returned by the model.
+            processor_prompt = await self.loop.run_in_executor(
+                None,
+                lambda: apply_chat_template(
+                    self.processor,
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    **self.apply_chat_template_kwargs,
+                ),
+            )
             prompt_ids = await self.apply_chat_template(
                 messages,
                 images=images,
@@ -104,6 +119,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             ),
             multi_modal_data=multi_modal_data,
             mm_processor_kwargs=mm_processor_kwargs,
+            processor_prompt=processor_prompt,
             num_turns=2,
             metrics=metrics,
             extra_fields=output.extra_fields,

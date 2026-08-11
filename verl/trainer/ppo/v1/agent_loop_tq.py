@@ -157,6 +157,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
             return
 
+        extra_info = dict(kwargs.get("extra_info") or {})
+        extra_info["split"] = "val" if validate else "train"
+        kwargs["extra_info"] = extra_info
         await self._compute_score(outputs, kwargs=kwargs)
 
         final_output = outputs[-1]

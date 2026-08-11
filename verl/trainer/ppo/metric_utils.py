@@ -483,9 +483,35 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         reward_mean = torch.mean(non_aborted_sequence_reward).detach().item()
         reward_max = torch.max(non_aborted_sequence_reward).detach().item()
         reward_min = torch.min(non_aborted_sequence_reward).detach().item()
+        reward_std = torch.std(non_aborted_sequence_reward, unbiased=False).detach().item()
     else:
         logger.warning("All samples are aborted, returning default reward metrics")
-        reward_mean = reward_max = reward_min = float("nan")
+        reward_mean = reward_max = reward_min = reward_std = float("nan")
+
+    # GRPO group diagnostics. ``uid`` identifies the prompt whose ROLLOUT_N
+    # responses form one group. These metrics are diagnostic only; advantage
+    # normalization remains controlled by norm_adv_by_std_in_grpo.
+    group_reward_stds = []
+    zero_variance_groups = 0
+    if "uid" in batch.batch:
+        grouped = {}
+        for uid, reward, valid in zip(batch.batch["uid"], sequence_reward, non_aborted_mask):
+            if bool(valid):
+                key = str(uid)
+                grouped.setdefault(key, []).append(reward)
+        for rewards in grouped.values():
+            if len(rewards) >= 2:
+                values = torch.stack(rewards)
+                std = torch.std(values, unbiased=False)
+                group_reward_stds.append(std)
+                if bool(std == 0):
+                    zero_variance_groups += 1
+    if group_reward_stds:
+        group_reward_std = torch.stack(group_reward_stds).mean().detach().item()
+        zero_variance_group_ratio = zero_variance_groups / len(group_reward_stds)
+    else:
+        group_reward_std = float("nan")
+        zero_variance_group_ratio = float("nan")
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
@@ -560,6 +586,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/rewards/mean": reward_mean,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
+        "critic/rewards/std": reward_std,
+        "grpo/group_reward_std": group_reward_std,
+        "grpo/zero_variance_group_ratio": zero_variance_group_ratio,
         # adv
         "critic/advantages/mean": adv_mean,
         "critic/advantages/max": adv_max,

@@ -17,6 +17,7 @@
 import asyncio
 import copy
 import logging
+import math
 import os
 import re
 import traceback
@@ -296,6 +297,15 @@ class RLHFDataset(Dataset):
     def __len__(self):
         return len(self.dataframe)
 
+    @staticmethod
+    def _resolve_media_path(value: str | os.PathLike) -> str:
+        """Resolve dataset-relative media paths independently of Ray's cwd."""
+        path = os.fspath(value)
+        media_root = os.environ.get("V35_GRPO_DATA_DIR")
+        if media_root and not os.path.isabs(path):
+            return os.path.join(media_root, path)
+        return path
+
     def _build_messages(self, example: dict, key: str):
         """Replace multimodal placeholders in messages with structured content.
 
@@ -315,6 +325,13 @@ class RLHFDataset(Dataset):
         images = example.get(self.image_key, None) or []
         videos = example.get(self.video_key, None) or []
         audios = example.get(self.audio_key, None) or []
+        image_min_pixels = self.config.get("image_min_pixels", None)
+        image_max_pixels = self.config.get("image_max_pixels", None)
+        video_min_pixels = self.config.get("video_min_pixels", None)
+        video_max_pixels = self.config.get("video_max_pixels", None)
+        # V35 SFT uses six ordered snapshots per decision window.  Do not let
+        # qwen_vl_utils fall back to its generic FPS-based frame sampling.
+        video_nframes = self.config.get("video_nframes", None)
 
         image_offset, video_offset, audio_offset = 0, 0, 0
         for message in messages:
@@ -341,7 +358,12 @@ class RLHFDataset(Dataset):
                             image["image"] = Image.open(BytesIO(image["bytes"]))
                         content_list.append({"type": "image", **image})
                     elif isinstance(image, str | os.PathLike):
-                        content_list.append({"type": "image", "image": os.fspath(image)})
+                        image_item = {"type": "image", "image": self._resolve_media_path(image)}
+                        if image_min_pixels is not None:
+                            image_item["min_pixels"] = int(image_min_pixels)
+                        if image_max_pixels is not None:
+                            image_item["max_pixels"] = int(image_max_pixels)
+                        content_list.append(image_item)
                     else:
                         raise TypeError(
                             f"image must be dict, PIL.Image, or path-like, unsupported image type: {type(image)}"
@@ -351,16 +373,26 @@ class RLHFDataset(Dataset):
                     assert video_offset < len(videos), f"video_offset {video_offset} >= len(videos) {len(videos)}"
                     video = videos[video_offset]
                     if isinstance(video, dict):
-                        content_list.append({"type": "video", **video})
+                        video_item = {"type": "video", **video}
                     elif isinstance(video, str | os.PathLike):
-                        content_list.append({"type": "video", "video": os.fspath(video)})
+                        video_item = {"type": "video", "video": self._resolve_media_path(video)}
                     elif isinstance(video, list):
-                        video = [os.fspath(frame) if isinstance(frame, os.PathLike) else frame for frame in video]
-                        content_list.append({"type": "video", "video": video})
+                        video = [
+                            self._resolve_media_path(frame) if isinstance(frame, os.PathLike) else frame
+                            for frame in video
+                        ]
+                        video_item = {"type": "video", "video": video}
                     else:
                         raise TypeError(
                             f"video must be dict, list, or path-like, unsupported video type: {type(video)}"
                         )
+                    if video_nframes is not None and "fps" not in video_item and "nframes" not in video_item:
+                        video_item["nframes"] = int(video_nframes)
+                    if video_min_pixels is not None:
+                        video_item.setdefault("min_pixels", int(video_min_pixels))
+                    if video_max_pixels is not None:
+                        video_item.setdefault("max_pixels", int(video_max_pixels))
+                    content_list.append(video_item)
                     video_offset += 1
                 elif segment == "<audio>":
                     assert audio_offset < len(audios), f"audio_offset {audio_offset} >= len(audios) {len(audios)}"
@@ -411,6 +443,26 @@ class RLHFDataset(Dataset):
         return row_dict
 
     @classmethod
+    def _configure_qwen_vision_limits(cls, image_patch_size, config: DictConfig) -> None:
+        """Raise qwen_vl_utils' generic video ceiling to the configured SFT ceiling.
+
+        qwen_vl_utils otherwise applies its generic per-frame video-token cap.
+        Qwen3.5 uses a 16-pixel patch and merge size 2 (factor 32), while V35
+        SFT used a higher explicit pixel ceiling.  The per-video ``max_pixels``
+        value below remains the final limit.
+        """
+        video_max_pixels = config.get("video_max_pixels", None)
+        if video_max_pixels is None:
+            return
+        import qwen_vl_utils.vision_process as vision_process
+
+        factor = int(image_patch_size) * int(vision_process.SPATIAL_MERGE_SIZE)
+        required_tokens = math.ceil(int(video_max_pixels) / (factor * factor))
+        vision_process.VIDEO_MAX_TOKEN_NUM = max(
+            int(vision_process.VIDEO_MAX_TOKEN_NUM), required_tokens
+        )
+
+    @classmethod
     async def process_vision_info(
         cls,
         messages: list[dict],
@@ -439,6 +491,7 @@ class RLHFDataset(Dataset):
             images: List of images.
             videos: List of videos, each video is a tuple of (video_tensor, video_metadata).
         """
+        cls._configure_qwen_vision_limits(image_patch_size, config)
         from qwen_vl_utils import process_vision_info
 
         # When called from an AgentLoop, many trajectory coroutines share one
@@ -488,6 +541,7 @@ class RLHFDataset(Dataset):
             for message in messages
         )
         if has_visual:
+            cls._configure_qwen_vision_limits(image_patch_size, config)
             from qwen_vl_utils import process_vision_info
 
             images, videos = process_vision_info(
