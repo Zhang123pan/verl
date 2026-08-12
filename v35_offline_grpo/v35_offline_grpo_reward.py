@@ -1,4 +1,4 @@
-"""Offline V35 GRPO reward: contract gate, counterfactual traffic, and Current V."""
+"""Offline V35 GRPO reward: contract gate and counterfactual traffic."""
 
 from __future__ import annotations
 
@@ -69,6 +69,16 @@ def _phase_map(perception: Any) -> dict[str, dict[str, Any]]:
     return {}
 
 
+def _has_exact_candidate_phases(perception: Any) -> bool:
+    if not isinstance(perception, dict):
+        return False
+    rows = perception.get("candidate_phases")
+    if not isinstance(rows, list) or len(rows) != len(PHASES):
+        return False
+    signals = [row.get("signal") for row in rows if isinstance(row, dict)]
+    return len(signals) == len(PHASES) and set(signals) == set(PHASES)
+
+
 def _valid_phase_row(row: Any, phase: str) -> bool:
     """Validate one perception row without raising on malformed model output."""
     if not isinstance(row, dict):
@@ -103,9 +113,9 @@ def _valid_phase_row(row: Any, phase: str) -> bool:
 
 
 def _format(solution: str) -> tuple[bool, bool, dict[str, Any]]:
-    names = ("perception", "mode", "reasoning", "current_v", "signal")
+    names = ("perception", "mode", "reasoning", "signal")
     blocks = {n: _tag(solution, n) for n in names}
-    required = ("perception", "mode", "current_v", "signal")
+    required = ("perception", "mode", "signal")
     signal_bad = (
         len(blocks["signal"]) != 1
         or not _has_exact_tag_pair(solution, "signal")
@@ -114,8 +124,8 @@ def _format(solution: str) -> tuple[bool, bool, dict[str, Any]]:
     if any(len(blocks[name]) != 1 or not _has_exact_tag_pair(solution, name) for name in required):
         return False, signal_bad, {}
     mode = blocks["mode"][0].strip().lower()
-    expected_order = ("perception", "mode", "current_v", "signal") if mode == "fast" else (
-        "perception", "mode", "reasoning", "current_v", "signal"
+    expected_order = ("perception", "mode", "signal") if mode == "fast" else (
+        "perception", "mode", "reasoning", "signal"
     )
     positions = [solution.lower().find(f"<{name}>") for name in expected_order]
     order = all(position >= 0 for position in positions) and positions == sorted(positions)
@@ -127,19 +137,21 @@ def _format(solution: str) -> tuple[bool, bool, dict[str, Any]]:
         and _has_exact_tag_pair(solution, "reasoning")
         and bool(blocks["reasoning"][0].strip())
     )
-    if not order or not reasoning_contract:
+    # The full match rejects old <current_v> blocks, code fences, and any
+    # additional top-level text/tags instead of silently accepting them.
+    if mode == "fast":
+        envelope = r"\s*<perception>.*?</perception>\s*<mode>fast</mode>\s*<signal>.*?</signal>\s*"
+    else:
+        envelope = r"\s*<perception>.*?</perception>\s*<mode>slow</mode>\s*<reasoning>.*?</reasoning>\s*<signal>.*?</signal>\s*"
+    exact_envelope = re.fullmatch(envelope, solution or "", flags=re.I | re.S) is not None
+    if not order or not reasoning_contract or not exact_envelope:
         return False, signal_bad, {}
     perception = _json(blocks["perception"][0])
-    current_v = _json(blocks["current_v"][0])
     phases = _phase_map(perception)
-    valid = mode in ("fast", "slow") and isinstance(current_v, dict) and set(current_v) == set(PHASES) and len(phases) == 4
+    valid = mode in ("fast", "slow") and _has_exact_candidate_phases(perception) and len(phases) == 4
     if valid:
         valid = all(_valid_phase_row(phases.get(phase), phase) for phase in PHASES)
-    if valid:
-        valid = all(isinstance(current_v[phase], int) and current_v[phase] >= 0 for phase in PHASES)
-    if valid:
-        valid = all(current_v[phase] == phases[phase]["current_v"]["total"] for phase in PHASES)
-    return bool(valid), signal_bad, {"mode": mode, "signal": blocks["signal"][0].strip(), "perception": perception, "current_v": current_v, "reasoning": blocks["reasoning"][0] if blocks["reasoning"] else ""}
+    return bool(valid), signal_bad, {"mode": mode, "signal": blocks["signal"][0].strip(), "perception": perception, "reasoning": blocks["reasoning"][0] if blocks["reasoning"] else ""}
 
 
 def _rank_scores(values: dict[str, float], higher_is_better: bool) -> dict[str, float]:
@@ -208,6 +220,13 @@ def _perception_values(value: Any) -> list[float]:
     return result
 
 
+def _perception_bad(solution: str, perception_obj: Any) -> bool:
+    if len(_perception_values(perception_obj)) != 44:
+        return True
+    perception_blocks = _tag(solution, "perception")
+    return len(perception_blocks) != 1
+
+
 @lru_cache(maxsize=1)
 def _tokenizer():
     from transformers import AutoTokenizer
@@ -244,20 +263,35 @@ def compute_score(solution_str, ground_truth, **kwargs):
             "reasoning_penalty": reasoning_penalty,
         }
         _write_reward_log({"split": split, "sample_id": sample_id, "solution": solution,
-                           "ground_truth": gt, **result})
+                           "ground_truth": gt, "parsed": parsed, "mode": output.get("mode"),
+                           "signal": output.get("signal"), "signal_bad": True,
+                           "perception_bad": False, **result})
         return result
 
     if not parsed:
         perception_blocks = _tag(solution, "perception")
-        current_v_blocks = _tag(solution, "current_v")
         signal_blocks = _tag(solution, "signal")
         output = {
             "mode": mode,
             "signal": signal_blocks[0].strip(),
             "perception": _json(perception_blocks[0]) if len(perception_blocks) == 1 else {},
-            "current_v": _json(current_v_blocks[0]) if len(current_v_blocks) == 1 else {},
             "reasoning": reasoning,
         }
+
+    perception_bad = _perception_bad(solution, output.get("perception"))
+    if perception_bad:
+        result = {
+            "score": -1.0,
+            "format_reward": 0.0,
+            "traffic_reward": 0.0,
+            "perception_reward": 0.0,
+            "reasoning_penalty": reasoning_penalty,
+        }
+        _write_reward_log({"split": split, "sample_id": sample_id, "solution": solution,
+                           "ground_truth": gt, "parsed": parsed, "mode": output.get("mode"),
+                           "signal": output.get("signal"), "signal_bad": False,
+                           "perception_bad": True, **result})
+        return result
 
     format_reward = 1.0 if parsed else 0.0
     predicted_values = _perception_values(output.get("perception"))
@@ -265,10 +299,14 @@ def compute_score(solution_str, ground_truth, **kwargs):
     correct = sum(abs(pred - target) <= 1 for pred, target in zip(predicted_values, target_values))
     perception_reward = correct / 44.0 if len(predicted_values) == 44 and len(target_values) == 44 else 0.0
     traffic_reward = _traffic(gt, output["signal"])
-    score = format_reward * (traffic_reward + 0.5 * perception_reward) - reasoning_penalty
+    base_reward = traffic_reward + 0.5 * perception_reward - reasoning_penalty
+    format_term = -0.5 if not parsed else 0.0
+    score = base_reward + format_term
     result = {
         "score": score,
         "format_reward": format_reward,
+        "format_term": format_term,
+        "base_reward": base_reward,
         "traffic_reward": traffic_reward,
         "perception_reward": perception_reward,
         "reasoning_penalty": reasoning_penalty,
@@ -277,5 +315,6 @@ def compute_score(solution_str, ground_truth, **kwargs):
     }
     _write_reward_log({"split": split, "sample_id": sample_id, "solution": solution,
                        "ground_truth": gt, "parsed": parsed, "mode": output.get("mode"),
-                       "signal": output.get("signal"), **result})
+                       "signal": output.get("signal"), "signal_bad": signal_bad,
+                       "perception_bad": perception_bad, **result})
     return result
