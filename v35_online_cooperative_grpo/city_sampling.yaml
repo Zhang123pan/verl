@@ -1,0 +1,21 @@
+# Online cooperative GRPO: city/seed sampling and automatic SUMO episode rotation.
+# Every batch has a fixed city composition, rather than independent weighted
+# draws. Jinan:Hangzhou:New York is 1:1:2, so batch sizes are multiples of 4.
+episode_seconds: 3600
+control_period_seconds: 30
+group_batch_size: 4
+rollout_n: 6
+sumo_branch_actor_limit: null
+cities:
+  jinan:
+    enabled: true
+    batch_units: 1
+    seeds: [1001, 1002, 1003, 1004]
+  hangzhou:
+    enabled: true
+    batch_units: 1
+    seeds: [2001, 2002, 2003, 2004]
+  newyork:
+    enabled: true
+    batch_units: 2
+    seeds: [3001, 3002, 3003, 3004]

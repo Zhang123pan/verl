@@ -12,10 +12,12 @@ from typing import Any
 
 PHASES = ("ETWT", "NTST", "ELWL", "NLSL")
 MOVEMENTS = {"ETWT": ("ET", "WT"), "NTST": ("NT", "ST"), "ELWL": ("EL", "WL"), "NLSL": ("NL", "SL")}
-SLOW_FIXED_COST = 0.01
+# Slow reasoning is free up to the response budget.  Otherwise fast would
+# strictly dominate a concise slow response with the same control outcome.
+SLOW_FIXED_COST = 0.0
 REASONING_FREE_TOKENS = 300
-REASONING_TAU = 200.0
-REASONING_MAX_LENGTH_PENALTY = 0.15
+REASONING_TAU = 400.0
+REASONING_MAX_LENGTH_PENALTY = 0.10
 
 
 def _write_reward_log(record: dict[str, Any]) -> None:
@@ -237,7 +239,7 @@ def _tokenizer():
 
 
 def _reasoning_penalty(mode: str, reasoning: str) -> float:
-    """Charge slow mode a fixed cost plus a smooth cost beyond 300 tokens."""
+    """Penalize only slow reasoning that exceeds the 300-token budget."""
     if mode != "slow":
         return 0.0
     try:
