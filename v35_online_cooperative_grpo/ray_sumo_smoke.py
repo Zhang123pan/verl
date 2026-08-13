@@ -23,7 +23,7 @@ def main() -> None:
     args = parser.parse_args()
     cfg = load_sampling_config(args.config)
     configs, paths = build_city_env_configs(args.repo_root, cfg.episode_seconds)
-    factory = SUMOEnvFactory(configs, paths, args.work_root)
+    factory = SUMOEnvFactory(configs, paths, args.work_root, repo_root=args.repo_root)
     ray.init(ignore_reinit_error=True)
     _Master, _Branch, RotatingMaster = create_actor_classes()
     masters = {

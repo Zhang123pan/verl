@@ -138,14 +138,20 @@ class SUMOEnvFactory:
     work directory, preventing TraCI port/files from crossing Ray actors.
     """
 
-    def __init__(self, config_by_city: Mapping[str, Mapping[str, Any]], paths_by_city: Mapping[str, Mapping[str, Any]], work_root: str):
+    def __init__(self, config_by_city: Mapping[str, Mapping[str, Any]], paths_by_city: Mapping[str, Mapping[str, Any]], work_root: str, repo_root: str | None = None):
         self.config_by_city = {key: deepcopy(value) for key, value in config_by_city.items()}
         self.paths_by_city = {key: deepcopy(value) for key, value in paths_by_city.items()}
         self.work_root = work_root
+        self.repo_root = str(Path(repo_root).resolve()) if repo_root else None
 
     def __call__(self, city: str, seed: int, actor_id: str) -> SUMOEnvAdapter:
         if city not in self.config_by_city or city not in self.paths_by_city:
             raise KeyError(f"No SUMO configuration registered for city {city!r}")
+        # Ray workers do not inherit the launcher cwd/PYTHONPATH reliably.
+        # Inject the repository root before importing the existing SUMOEnv.
+        import sys
+        if self.repo_root and self.repo_root not in sys.path:
+            sys.path.insert(0, self.repo_root)
         from utils.sumo_env import SUMOEnv
 
         work_dir = Path(self.work_root) / city / actor_id
