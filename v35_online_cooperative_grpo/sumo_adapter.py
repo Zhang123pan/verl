@@ -84,9 +84,20 @@ class SUMOEnvAdapter:
         return result
 
     def execute(self, actions: dict[str, str], seconds: int) -> dict[str, Any]:
-        state, done, info = self.env.step(self._action_indices(actions), min_action_time=seconds)
+        # SUMOEnv follows the gym-style four-value API: state, reward, done, info.
+        step_result = self.env.step(self._action_indices(actions), min_action_time=seconds)
+        # Production SUMOEnv returns four values; keep compatibility with the
+        # lightweight three-value test/dummy environments used by the suite.
+        if len(step_result) == 4:
+            state, reward, done, info = step_result
+        elif len(step_result) == 3:
+            state, done, info = step_result
+            reward = 0.0
+        else:
+            raise ValueError(f"SUMOEnv.step returned {len(step_result)} values")
         return {
             "state": state,
+            "reward": reward,
             "done": bool(done),
             "info": info,
             "sim_time_s": float(self.env.get_current_time()),

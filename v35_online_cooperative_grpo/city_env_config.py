@@ -13,6 +13,7 @@ CITY_SPECS = {
     "hangzhou": ("Hangzhou", "4_4", "hangzhou_phase.net.xml", "hangzhou.rou.xml", "hangzhou.sumocfg", "hangzhou_phase_mapping.json"),
     "newyork": ("NewYork", "28_7", "newyork_phase.net.xml", "newyork.rou.xml", "newyork.sumocfg", "newyork_phase_mapping.json"),
 }
+STANDARD_PHASES = ("ETWT", "NTST", "ELWL", "NLSL")
 
 
 def build_city_env_configs(repo_root: str | Path, episode_seconds: int = 3600) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -26,7 +27,19 @@ def build_city_env_configs(repo_root: str | Path, episode_seconds: int = 3600) -
     configs, paths = {}, {}
     for city, (template, roadnet, net, route, sumocfg, mapping_file) in CITY_SPECS.items():
         data_dir = root / "data" / template / roadnet
-        mapping = json.loads((data_dir / mapping_file).read_text(encoding="utf-8"))
+        raw_mapping = json.loads((data_dir / mapping_file).read_text(encoding="utf-8"))
+        # The source files also list turn-specific phases (ELET/WLWT/NLNT/SLST).
+        # Online V35 controls only the canonical four phases, so make that
+        # contract explicit before constructing SUMOEnv.
+        mapping = {}
+        for inter_id, phases in raw_mapping.items():
+            filtered = [phase for phase in STANDARD_PHASES if phase in phases]
+            if len(filtered) != len(STANDARD_PHASES):
+                raise ValueError(
+                    f"{city}/{inter_id} phase mapping must contain all four "
+                    f"phases {STANDARD_PHASES}; got {phases!r}"
+                )
+            mapping[inter_id] = filtered
         rows, cols = (int(value) for value in roadnet.split("_"))
         configs[city] = {
             "NUM_AGENTS": rows * cols,
