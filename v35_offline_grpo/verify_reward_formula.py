@@ -74,15 +74,27 @@ def main() -> None:
     reward._tokenizer = lambda: FixedTokenizer()
     slow_result = reward.compute_score(_solution("slow", target, "concise reasoning"), ground_truth)
     slow_score = slow_result["score"]
-    expected = 1.0 + 0.5 * 1.0 - reward.P_MAX * (1.0 - math.exp(-300 / reward.TAU))
+    expected = 1.0 + 0.5 * 1.0 - reward.SLOW_FIXED_COST
     assert math.isclose(slow_score, expected), (slow_score, expected)
+
+    class LongTokenizer:
+        def __call__(self, _text, add_special_tokens=False):
+            return {"input_ids": list(range(500))}
+
+    reward._tokenizer = lambda: LongTokenizer()
+    long_result = reward.compute_score(_solution("slow", target, "long reasoning"), ground_truth)
+    expected_long_penalty = reward.SLOW_FIXED_COST + reward.REASONING_MAX_LENGTH_PENALTY * (
+        1.0 - math.exp(-(500 - reward.REASONING_FREE_TOKENS) / reward.REASONING_TAU)
+    )
+    expected_long = 1.0 + 0.5 * 1.0 - expected_long_penalty
+    assert math.isclose(long_result["score"], expected_long), (long_result, expected_long)
 
     misplaced = _solution("slow", target, "x").replace(
         "<reasoning>x</reasoning>", ""
     ).replace("<signal>ETWT</signal>", "<signal>ETWT</signal><reasoning>x</reasoning>")
     invalid_result = reward.compute_score(misplaced, ground_truth)
     invalid_score = invalid_result["score"]
-    expected_invalid = 1.0 + 0.5 - reward.P_MAX * (1.0 - math.exp(-300 / reward.TAU)) - 0.5
+    expected_invalid = 1.0 + 0.5 - expected_long_penalty - 0.5
     assert math.isclose(invalid_score, expected_invalid), (invalid_score, expected_invalid)
     assert invalid_result["format_reward"] == 0.0
 

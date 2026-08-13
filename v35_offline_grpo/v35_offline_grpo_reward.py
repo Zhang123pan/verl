@@ -12,8 +12,10 @@ from typing import Any
 
 PHASES = ("ETWT", "NTST", "ELWL", "NLSL")
 MOVEMENTS = {"ETWT": ("ET", "WT"), "NTST": ("NT", "ST"), "ELWL": ("EL", "WL"), "NLSL": ("NL", "SL")}
-TAU = 300.0
-P_MAX = 0.3
+SLOW_FIXED_COST = 0.01
+REASONING_FREE_TOKENS = 300
+REASONING_TAU = 200.0
+REASONING_MAX_LENGTH_PENALTY = 0.15
 
 
 def _write_reward_log(record: dict[str, Any]) -> None:
@@ -234,6 +236,21 @@ def _tokenizer():
     return AutoTokenizer.from_pretrained(path, trust_remote_code=True)
 
 
+def _reasoning_penalty(mode: str, reasoning: str) -> float:
+    """Charge slow mode a fixed cost plus a smooth cost beyond 300 tokens."""
+    if mode != "slow":
+        return 0.0
+    try:
+        token_count = len(_tokenizer()(reasoning, add_special_tokens=False)["input_ids"])
+    except Exception:
+        token_count = len(reasoning.split())
+    excess = max(0, token_count - REASONING_FREE_TOKENS)
+    length_penalty = REASONING_MAX_LENGTH_PENALTY * (
+        1.0 - math.exp(-excess / REASONING_TAU)
+    )
+    return SLOW_FIXED_COST + length_penalty
+
+
 def compute_score(solution_str, ground_truth, **kwargs):
     gt = _json(ground_truth) or {}
     solution = solution_str or ""
@@ -245,14 +262,7 @@ def compute_score(solution_str, ground_truth, **kwargs):
     reasoning_blocks = _tag(solution, "reasoning")
     mode = mode_blocks[0].strip().lower() if len(mode_blocks) == 1 else ""
     reasoning = reasoning_blocks[0] if len(reasoning_blocks) == 1 else ""
-    if mode == "slow":
-        try:
-            length = len(_tokenizer()(reasoning, add_special_tokens=False)["input_ids"])
-        except Exception:
-            length = len(reasoning.split())
-        reasoning_penalty = P_MAX * (1.0 - math.exp(-length / TAU))
-    else:
-        reasoning_penalty = 0.0
+    reasoning_penalty = _reasoning_penalty(mode, reasoning)
 
     if signal_bad:
         result = {

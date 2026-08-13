@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_PATH=${MODEL_PATH:-/home/apulis-dev/userdata/VLMTSCS/training/LlamaFactory/saves/qwen35-4b/merged/v35_four_video_context_reasoning_512x960}
+MODEL_PATH=${MODEL_PATH:-/home/apulis-dev/userdata/VLMTSCS/training/LlamaFactory/saves/qwen35-4b/merged/v35_four_video_context_reasoning_512x960_4tags}
 DATA_DIR=${DATA_DIR:-/home/apulis-dev/userdata/VLMTSCS/grpo_v30_offline_local_video_dataset_reduced_pixels}
-WORK_DIR=${WORK_DIR:-/home/apulis-dev/userdata/VLMTSCS/training/LlamaFactory/runs/v35_4b_offline_grpo}
+WORK_DIR=${WORK_DIR:-/home/apulis-dev/userdata/VLMTSCS/training/LlamaFactory/runs/v35_4b_offline_grpo_512x960_4tags}
 REWARD_LOG=${REWARD_LOG:-${WORK_DIR}/reward_details.jsonl}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 N_GPUS=${N_GPUS:-4}
