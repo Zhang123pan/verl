@@ -18,6 +18,7 @@ SLOW_FIXED_COST = 0.0
 REASONING_FREE_TOKENS = 300
 REASONING_TAU = 400.0
 REASONING_MAX_LENGTH_PENALTY = 0.10
+FAST_DECISION_PENALTY = 0.05
 
 
 def _write_reward_log(record: dict[str, Any]) -> None:
@@ -311,7 +312,21 @@ def compute_score(solution_str, ground_truth, **kwargs):
     correct = sum(abs(pred - target) <= 1 for pred, target in zip(predicted_values, target_values))
     perception_reward = correct / 44.0 if len(predicted_values) == 44 and len(target_values) == 44 else 0.0
     traffic_reward = _traffic(gt, output["signal"])
-    base_reward = traffic_reward + 0.5 * perception_reward - reasoning_penalty
+    actions = gt.get("actions", {})
+    action_rewards = {
+        phase: _traffic(gt, phase) for phase in PHASES
+    } if isinstance(actions, dict) and set(actions) == set(PHASES) else {}
+    best_traffic_reward = max(action_rewards.values(), default=traffic_reward)
+    # Fast is intended for an unambiguous quick decision.  Penalize only a
+    # strictly suboptimal fast action; ties for the best counterfactual remain
+    # valid. Slow already receives the natural traffic reward and is not
+    # double-penalized here.
+    fast_decision_penalty = (
+        FAST_DECISION_PENALTY
+        if output.get("mode") == "fast" and traffic_reward < best_traffic_reward
+        else 0.0
+    )
+    base_reward = traffic_reward + 0.5 * perception_reward - reasoning_penalty - fast_decision_penalty
     format_term = -0.5 if not parsed else 0.0
     score = base_reward + format_term
     result = {
@@ -322,6 +337,8 @@ def compute_score(solution_str, ground_truth, **kwargs):
         "traffic_reward": traffic_reward,
         "perception_reward": perception_reward,
         "reasoning_penalty": reasoning_penalty,
+        "best_traffic_reward": best_traffic_reward,
+        "fast_decision_penalty": fast_decision_penalty,
         "perception_correct": correct,
         "perception_total": 44,
     }
