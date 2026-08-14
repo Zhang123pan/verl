@@ -10,6 +10,27 @@ from v35_online_cooperative_grpo.prompt_builder import (
 )
 
 
+def test_multimodal_sender_preserves_media_items():
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "prefix\n" + BASE_LAYOUT},
+        {"type": "video_url", "video_url": {"url": "x"}},
+        {"type": "image_url", "image_url": {"url": "y"}},
+    ]}]
+    result = build_sender_prompt(messages)
+    assert result[0]["content"][0]["text"].count("<message>") >= 1
+    assert result[0]["content"][1:] == messages[0]["content"][1:]
+
+
+def test_multimodal_receiver_appends_context_to_text_only():
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "prompt"},
+        {"type": "video_url", "video_url": {"url": "x"}},
+    ]}]
+    result = build_receiver_prompt(messages, "routed")
+    assert "routed" in result[0]["content"][0]["text"]
+    assert result[0]["content"][1] == messages[0]["content"][1]
+
+
 def base_messages():
     root = Path(__file__).parents[2]
     row = json.loads((root / "../../grpo_v30_offline_local_video_dataset_reduced_pixels/train_2000.jsonl").resolve().read_text().splitlines()[0])

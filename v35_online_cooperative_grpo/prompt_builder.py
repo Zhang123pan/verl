@@ -87,14 +87,38 @@ def _user_message(messages: list[dict[str, Any]]) -> dict[str, Any]:
     return users[0]
 
 
+def _user_text(messages: list[dict[str, Any]]) -> tuple[dict[str, Any], str]:
+    """Return the mutable text slot for text-only or OpenAI multimodal input."""
+    user = _user_message(messages)
+    content = user.get("content")
+    if isinstance(content, str):
+        return user, content
+    if isinstance(content, list):
+        text_items = [
+            item for item in content
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
+        ]
+        if len(text_items) != 1:
+            raise ValueError(f"Expected exactly one multimodal user text item, found {len(text_items)}.")
+        return text_items[0], text_items[0]["text"]
+    raise ValueError("User content must be a string or OpenAI multimodal content list.")
+
+
+def _replace_user_text(messages: list[dict[str, Any]], text: str) -> None:
+    slot, _old = _user_text(messages)
+    if slot.get("type") == "text":
+        slot["text"] = text
+    else:
+        slot["content"] = text
+
+
 def build_sender_prompt(base_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep the offline-GRPO prompt verbatim except its output-layout block."""
     messages = deepcopy(base_messages)
-    user = _user_message(messages)
-    content = user["content"]
+    _slot, content = _user_text(messages)
     if content.count(BASE_LAYOUT) != 1:
         raise ValueError("Offline GRPO baseline layout block is missing or duplicated.")
-    user["content"] = content.replace(BASE_LAYOUT, SENDER_LAYOUT, 1) + SENDER_MESSAGE_RULES
+    _replace_user_text(messages, content.replace(BASE_LAYOUT, SENDER_LAYOUT, 1) + SENDER_MESSAGE_RULES)
     return messages
 
 
@@ -104,5 +128,6 @@ def build_receiver_prompt(
     """Keep the baseline response protocol and inject current-cycle router output."""
     messages = deepcopy(base_messages)
     if message_context:
-        _user_message(messages)["content"] += RECEIVER_SUFFIX.format(message_context=message_context)
+        _slot, content = _user_text(messages)
+        _replace_user_text(messages, content + RECEIVER_SUFFIX.format(message_context=message_context))
     return messages
