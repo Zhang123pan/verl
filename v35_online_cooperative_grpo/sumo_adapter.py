@@ -247,6 +247,68 @@ class SUMOEnvFactory:
         return adapter
 
 
+class V30RecordingMasterFactory(SUMOEnvFactory):
+    """Create a Ray-local V30 mainline runtime with renderer and recorder."""
+
+    def __call__(self, city: str, seed: int, actor_id: str) -> V30RecordingMasterAdapter:
+        if city not in self.config_by_city or city not in self.paths_by_city:
+            raise KeyError(f"No SUMO configuration registered for city {city!r}")
+        import sys
+        if self.repo_root and self.repo_root not in sys.path:
+            sys.path.insert(0, self.repo_root)
+        from utils.oneline import OneLine
+        from utils.vlm_config import get_vlm_config
+
+        class RecordingRuntime(OneLine):
+            # The online master uses the adapter's V25 background policy; it
+            # does not need one Python controller object per intersection.
+            def _create_agents(self) -> None:
+                self.agents = []
+
+        work_dir = Path(self.work_root) / city / actor_id
+        model_dir = work_dir / "models"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        model_dir.mkdir(parents=True, exist_ok=True)
+        config = deepcopy(self.config_by_city[city])
+        paths = deepcopy(self.paths_by_city[city])
+        vlm_config = get_vlm_config(city)
+        vlm_config.update({
+            "DECISION_INPUT_MODE": "video",
+            "VIDEO_INCLUDE_CURRENT_IMAGES": False,
+            "VIDEO_EXPORT_DIRECTIONS": True,
+            "VIDEO_EXPORT_COMPOSITE": False,
+            "VIDEO_EXPORT_DIRECTION_SEQUENCE": False,
+            "VIDEO_RECORD_MODE": "sampled",
+            "VIDEO_FRAME_SAMPLE_INTERVAL": 5.0,
+            "VIDEO_FPS": 1,
+            "VIDEO_SAVE_COORDINATION_FRAMES": True,
+            "VIDEO_ASYNC_WRITE": False,
+            "RENDER_PRESET": "1080P",
+            "RENDERING_BACKEND": "p3headlessgl",
+            "RENDER_KEEP_BATCH_SENSORS": False,
+            "RENDER_REUSE_BATCH_SENSORS": True,
+            "RENDER_STEP_TASK_MANAGER": False,
+            "LOCAL_RENDER_RADIUS_M": 180.0,
+        })
+        if city == "newyork":
+            vlm_config["TLS_BATCH_SIZE"] = 20
+        config.update({
+            "MODEL_NAME": "V25",
+            "USE_GUI": False,
+            "SEED": int(seed),
+            "ENABLE_VIDEO_SFT_EXTRACTION": True,
+            "ENABLE_COUNTERFACTUAL_DISCHARGE_LOG": False,
+            "RAISE_INNER_STEP_CALLBACK_ERRORS": True,
+            "VLM_CONFIG": vlm_config,
+        })
+        topology = Path(paths["PATH_TO_DATA"]) / "network_topology.json"
+        if topology.is_file():
+            config["NETWORK_TOPOLOGY_PATH"] = str(topology)
+        paths.update({"PATH_TO_WORK_DIRECTORY": str(work_dir), "PATH_TO_MODEL": str(model_dir)})
+        runtime = RecordingRuntime({}, config, paths, city, config["TRAFFIC_FILE"])
+        return V30RecordingMasterAdapter(runtime, seed)
+
+
 class MultiCityBranchAdapter:
     """Rebuild an actor-local SUMOEnv when a mixed-city batch changes identity."""
 
