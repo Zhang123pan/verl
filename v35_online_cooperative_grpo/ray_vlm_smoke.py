@@ -27,16 +27,38 @@ def _data_url(path: str) -> str:
     return f"data:{mime};base64," + base64.b64encode(Path(path).read_bytes()).decode("ascii")
 
 
+def _load_prompt_template(path: str) -> tuple[str, str]:
+    with open(path, encoding="utf-8") as handle:
+        row = json.loads(handle.readline())
+    prompt = row.get("prompt") or row.get("messages")
+    if not isinstance(prompt, list):
+        raise ValueError(f"Prompt template has no prompt/messages list: {path}")
+    system = next((m.get("content", "") for m in prompt if m.get("role") == "system"), "")
+    user = next((m.get("content", "") for m in prompt if m.get("role") == "user"), "")
+    if not system or not user:
+        raise ValueError(f"Prompt template must contain system and user messages: {path}")
+    return str(system), str(user)
+
+
 def _query(api_url: str, api_key: str, model: str, videos: dict[str, str], timeout: float,
-           temperature: float) -> str:
-    content = [{"type": "text", "text": (
-        "Analyze this focal intersection using the four directional videos. "
-        "Return only the required XML tags and choose one signal from ETWT, NTST, ELWL, NLSL."
-    )}]
+           temperature: float, prompt_template: tuple[str, str] | None, focal_id: str) -> str:
+    if prompt_template:
+        system_text, user_text = prompt_template
+        user_text = re.sub(r"Intersection:\s*[^\n]+", f"Intersection: {focal_id}", user_text, count=1)
+        user_text += "\n\nOnline smoke observation: no additional coordination frames are available for this cycle."
+    else:
+        system_text = "You are a visual traffic signal controller."
+        user_text = (
+            "Analyze this focal intersection using the four directional videos. "
+            "Return only the required XML tags and choose one signal from ETWT, NTST, ELWL, NLSL."
+        )
+    content = [{"type": "text", "text": user_text}]
     for direction in ("E", "W", "N", "S"):
         content.append({"type": "text", "text": f"Direction {direction}:"})
         content.append({"type": "video_url", "video_url": {"url": _data_url(videos[direction])}})
-    payload = {"model": model, "messages": [{"role": "user", "content": content}],
+    payload = {"model": model, "messages": [
+                   {"role": "system", "content": system_text},
+                   {"role": "user", "content": content}],
                "max_tokens": 2048, "temperature": temperature,
                "enable_thinking": False}
     headers = {"Content-Type": "application/json"}
@@ -64,6 +86,10 @@ def main() -> None:
     parser.add_argument("--api-url", default="http://localhost:8088/v1/chat/completions")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--api-config", default="")
+    parser.add_argument(
+        "--prompt-template",
+        default="/home/zhangpan/VLMTSCS/grpo_v30_offline_local_video_dataset_reduced_pixels/train.jsonl",
+    )
     parser.add_argument("--model", default="")
     parser.add_argument("--cities", default="jinan")
     parser.add_argument("--rollout-n", type=int, default=6)
@@ -83,6 +109,7 @@ def main() -> None:
         args.model = private.get("model", args.model)
     if not args.model:
         parser.error("--model or api_config.model is required")
+    prompt_template = _load_prompt_template(args.prompt_template)
     cfg = load_sampling_config(args.config)
     cities = [x.strip().lower() for x in args.cities.split(",") if x.strip()]
     configs, paths = build_city_env_configs(args.repo_root, cfg.episode_seconds)
@@ -105,7 +132,7 @@ def main() -> None:
             focal_id, observation = sorted(snapshot.observations.items())[0]
             for branch_id in range(args.rollout_n):
                 raw = _query(args.api_url, args.api_key, args.model, observation.videos,
-                             args.timeout, args.temperature)
+                             args.timeout, args.temperature, prompt_template, focal_id)
                 signal = _signal(raw)
                 fallback = signal is None
                 if fallback:
