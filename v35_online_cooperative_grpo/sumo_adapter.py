@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .ray_actors import SnapshotRef
+from .observation import V30Observation
 
 
 def _phase_vehicle_count(intersection: Any, phase: str) -> int:
@@ -143,6 +144,71 @@ class SUMOEnvAdapter:
     def observations(self) -> dict[str, Any] | None:
         """Bare SUMO smoke adapters do not own the V30 renderer/recorder."""
         return None
+
+
+class V30RecordingMasterAdapter(SUMOEnvAdapter):
+    """Master-only adapter that reuses OneLine's V30 renderer callbacks."""
+
+    def __init__(self, runtime: Any, seed: int | None = None):
+        super().__init__(runtime.env, seed)
+        self.runtime = runtime
+        self.decision_step = 0
+        self._observations: dict[str, V30Observation] = {}
+
+    def reset(self, seed: int | None = None) -> None:
+        self.seed = self.seed if seed is None else int(seed)
+        self.env.reset(use_gui=False, seed=self.seed, verbose=False)
+        self.runtime._reset_perception_renderer()
+        self.v25 = V25State()
+        self.decision_step = 0
+        self._observations = {}
+
+    def advance_background(self, seconds: int) -> None:
+        start_s = float(self.env.get_current_time())
+        actions = self.background_actions()
+        self.runtime._begin_video_interval(self.decision_step, start_s)
+        try:
+            self.env.step(
+                self._action_indices(actions),
+                min_action_time=seconds,
+                inner_step_callback=self.runtime._build_perception_snapshot_callback(self.decision_step),
+            )
+            details = self.runtime._finalize_video_interval(float(self.env.get_current_time()))
+        except BaseException as exc:
+            self.runtime._finalize_video_interval(
+                float(self.env.get_current_time()), status="incomplete",
+                error=f"{type(exc).__name__}: {exc}", force_discard=True,
+            )
+            raise
+        end_s = float(self.env.get_current_time())
+        paths = details.get("paths", {}) if isinstance(details, dict) else {}
+        frame_counts = details.get("frame_counts", {}) if isinstance(details, dict) else {}
+        observations = {}
+        for inter in self.env.list_intersection:
+            videos = paths.get(inter.inter_id, {})
+            if set(videos) != {"E", "W", "N", "S"}:
+                raise RuntimeError(f"V30 recorder did not produce four videos for {inter.inter_id}: {videos}")
+            if int(frame_counts.get(inter.inter_id, 0)) != 6:
+                raise RuntimeError(
+                    f"V30 recorder expected six frames for {inter.inter_id}, got {frame_counts.get(inter.inter_id)}"
+                )
+            observation = V30Observation(
+                inter.inter_id, self.decision_step, start_s, end_s,
+                {direction: videos[direction] for direction in ("E", "W", "N", "S")},
+            )
+            observation.validate(seconds)
+            observations[inter.inter_id] = observation
+        self._observations = observations
+        self.decision_step += 1
+
+    def observations(self) -> dict[str, V30Observation]:
+        return dict(self._observations)
+
+    def close(self) -> None:
+        close_capture = getattr(self.runtime, "_close_perception_image_capture", None)
+        if callable(close_capture):
+            close_capture()
+        self.env.close()
 
 
 class SUMOEnvFactory:
