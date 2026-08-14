@@ -37,7 +37,8 @@ def _query(api_url: str, api_key: str, model: str, videos: dict[str, str], timeo
         content.append({"type": "text", "text": f"Direction {direction}:"})
         content.append({"type": "video_url", "video_url": {"url": _data_url(videos[direction])}})
     payload = {"model": model, "messages": [{"role": "user", "content": content}],
-               "max_tokens": 1024, "temperature": temperature}
+               "max_tokens": 2048, "temperature": temperature,
+               "enable_thinking": False}
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -45,7 +46,8 @@ def _query(api_url: str, api_key: str, model: str, videos: dict[str, str], timeo
                                      headers=headers, method="POST")
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = json.loads(response.read().decode())
-    return str(body["choices"][0]["message"]["content"])
+    message = body["choices"][0]["message"]
+    return str(message.get("content") or message.get("reasoning_content") or "")
 
 
 def _signal(text: str) -> str:
