@@ -276,6 +276,15 @@ class V30RecordingMasterFactory(SUMOEnvFactory):
         if rendering_backend not in {"p3headlessgl", "p3tinydisplay", "pandagl"}:
             raise ValueError(f"Unsupported V35_RENDERING_BACKEND: {rendering_backend!r}")
         vlm_config = get_vlm_config(city)
+        print({
+            "v35_renderer_city": city,
+            "backend": rendering_backend,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "ray_preserve_cuda_visible_devices": os.environ.get(
+                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"
+            ),
+            "scenario_glb_dir": vlm_config.get("SCENARIO_GLB_DIR"),
+        })
         vlm_config.update({
             "DECISION_INPUT_MODE": "video",
             "VIDEO_INCLUDE_CURRENT_IMAGES": False,

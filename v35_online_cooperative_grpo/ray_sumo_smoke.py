@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import ray
@@ -28,6 +29,13 @@ def main() -> None:
     configs, paths = build_city_env_configs(args.repo_root, cfg.episode_seconds)
     factory_class = V30RecordingMasterFactory if args.record_observations else SUMOEnvFactory
     factory = factory_class(configs, paths, args.work_root, repo_root=args.repo_root)
+    # p3headlessgl/EGL enumerates physical render devices.  Ray's default
+    # CUDA_VISIBLE_DEVICES remapping makes an otherwise working run_v35
+    # renderer fail inside an actor, even though Ray has reserved a GPU for
+    # that actor.  Keep Ray's num_gpus placement/accounting, but preserve the
+    # driver's physical device visibility for the renderer process.
+    if args.record_observations:
+        os.environ.setdefault("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
     ray.init(ignore_reinit_error=True)
     _Master, _Branch, RotatingMaster = create_actor_classes()
     selected_names = [value.strip() for value in args.cities.split(",") if value.strip()]
