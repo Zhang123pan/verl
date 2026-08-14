@@ -1,0 +1,5 @@
+{
+  "api_url": "https://api.siliconflow.cn/v1/chat/completions",
+  "api_key": "sk-nvxprbmfipkmpcyrahlyrqlgomfpevoornhbwycptuglingf",
+  "model": "Qwen/Qwen3.5-4B"
+}

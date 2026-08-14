@@ -131,6 +131,3 @@ logs
 log
 outputs
 .history
-
-# Local API credentials
-v35_online_cooperative_grpo/private_api.json
