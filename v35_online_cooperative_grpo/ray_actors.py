@@ -19,6 +19,7 @@ class SnapshotRef:
     path: str
     sim_time_s: float
     seed: int | None = None
+    observations: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class TimelineAdapter(Protocol):
     def advance_background(self, seconds: int) -> None: ...
     def save_snapshot(self, path: str) -> float: ...
     def close(self) -> None: ...
+    def observations(self) -> dict[str, Any]: ...
 
 
 class BranchAdapter(Protocol):
@@ -79,7 +81,8 @@ def create_actor_classes():
             sim_time = float(self.adapter.save_snapshot(path))
             if not os.path.isfile(path) or os.path.getsize(path) <= 0:
                 raise RuntimeError(f"SUMO snapshot was not created: {path}")
-            return SnapshotRef(self.city, self.episode_id, snapshot_id, path, sim_time)
+            observations = self.adapter.observations() if hasattr(self.adapter, "observations") else None
+            return SnapshotRef(self.city, self.episode_id, snapshot_id, path, sim_time, observations=observations)
 
         def advance_and_publish(self, seconds: int = 30) -> SnapshotRef:
             if seconds <= 0:
@@ -119,7 +122,8 @@ def create_actor_classes():
             sim_time = float(self.adapter.save_snapshot(path))
             if not os.path.isfile(path) or os.path.getsize(path) <= 0:
                 raise RuntimeError(f"SUMO snapshot was not created: {path}")
-            return SnapshotRef(self.city, self.episode_id, snapshot_id, path, sim_time, self.seed)
+            observations = self.adapter.observations() if hasattr(self.adapter, "observations") else None
+            return SnapshotRef(self.city, self.episode_id, snapshot_id, path, sim_time, self.seed, observations)
 
         def advance_and_publish(self, seconds: int = 30) -> SnapshotRef:
             if seconds <= 0 or seconds > self.episode_seconds:

@@ -140,6 +140,10 @@ class SUMOEnvAdapter:
     def advance_background(self, seconds: int) -> None:
         self.execute(self.background_actions(), seconds)
 
+    def observations(self) -> dict[str, Any] | None:
+        """Bare SUMO smoke adapters do not own the V30 renderer/recorder."""
+        return None
+
 
 class SUMOEnvFactory:
     """Pickle-friendly factory injected into Ray actors by the online launcher.
