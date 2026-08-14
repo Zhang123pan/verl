@@ -163,6 +163,9 @@ def main() -> None:
                     "signal": signal,
                     "fallback": fallback,
                     "response": raw,
+                    "videos": dict(observation.videos),
+                    "prompt_template": args.prompt_template,
+                    "model": args.model,
                     "actions": actions,
                 })
         results = ray.get(all_results)
