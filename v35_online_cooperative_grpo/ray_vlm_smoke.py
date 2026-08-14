@@ -1,0 +1,108 @@
+"""One-batch Ray/VLM/SUMO integration smoke test."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import re
+import urllib.request
+from functools import partial
+from pathlib import Path
+
+import ray
+
+from .city_env_config import build_city_env_configs
+from .city_scheduler import load_sampling_config
+from .ray_actors import BranchRequest, create_actor_classes
+from .sumo_adapter import MultiCityBranchAdapter, SUMOEnvFactory
+
+
+SIGNALS = {"ETWT", "NTST", "ELWL", "NLSL"}
+
+
+def _data_url(path: str) -> str:
+    suffix = Path(path).suffix.lower()
+    mime = "video/mp4" if suffix == ".mp4" else "application/octet-stream"
+    return f"data:{mime};base64," + base64.b64encode(Path(path).read_bytes()).decode("ascii")
+
+
+def _query(api_url: str, model: str, videos: dict[str, str], timeout: float) -> str:
+    content = [{"type": "text", "text": (
+        "Analyze this focal intersection using the four directional videos. "
+        "Return only the required XML tags and choose one signal from ETWT, NTST, ELWL, NLSL."
+    )}]
+    for direction in ("E", "W", "N", "S"):
+        content.append({"type": "text", "text": f"Direction {direction}:"})
+        content.append({"type": "video_url", "video_url": {"url": _data_url(videos[direction])}})
+    payload = {"model": model, "messages": [{"role": "user", "content": content}],
+               "max_tokens": 1024, "temperature": 0}
+    request = urllib.request.Request(api_url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = json.loads(response.read().decode())
+    return str(body["choices"][0]["message"]["content"])
+
+
+def _signal(text: str) -> str:
+    match = re.search(r"<signal>\s*(ETWT|NTST|ELWL|NLSL)\s*</signal>", text, re.I)
+    return match.group(1).upper() if match else "ETWT"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=str(Path(__file__).with_name("city_sampling.yaml")))
+    parser.add_argument("--repo-root", required=True)
+    parser.add_argument("--work-root", required=True)
+    parser.add_argument("--snapshot-dir", required=True)
+    parser.add_argument("--api-url", default="http://localhost:8088/v1/chat/completions")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--cities", default="jinan")
+    parser.add_argument("--rollout-n", type=int, default=6)
+    parser.add_argument("--horizon-s", type=int, default=30)
+    parser.add_argument("--timeout", type=float, default=900)
+    args = parser.parse_args()
+    cfg = load_sampling_config(args.config)
+    cities = [x.strip().lower() for x in args.cities.split(",") if x.strip()]
+    configs, paths = build_city_env_configs(args.repo_root, cfg.episode_seconds)
+    factory = SUMOEnvFactory(configs, paths, args.work_root, repo_root=args.repo_root)
+    ray.init(ignore_reinit_error=True)
+    _Master, Branch, RotatingMaster = create_actor_classes()
+    seed_map = {spec.name: list(spec.seeds) for spec in cfg.cities}
+    masters = {city: RotatingMaster.remote(factory, city, seed_map[city],
+                                           str(Path(args.snapshot_dir) / city), cfg.episode_seconds)
+               for city in cities}
+    branches = []
+    try:
+        snapshots = ray.get([masters[city].advance_and_publish.remote(cfg.control_period_seconds)
+                             for city in cities])
+        all_results = []
+        for snapshot in snapshots:
+            if not snapshot.observations:
+                raise RuntimeError("Snapshot has no V30 observations")
+            focal_id, observation = sorted(snapshot.observations.items())[0]
+            raw = _query(args.api_url, args.model, observation.videos, args.timeout)
+            signal = _signal(raw)
+            actions = {inter_id: "ETWT" for inter_id in configs[snapshot.city]["INTER_PHASE_MAPPING"]}
+            actions[focal_id] = signal
+            print(json.dumps({"snapshot_id": snapshot.snapshot_id, "focal_id": focal_id,
+                              "signal": signal, "response": raw}, ensure_ascii=False))
+            for branch_id in range(args.rollout_n):
+                actor = Branch.remote(partial(MultiCityBranchAdapter, factory, f"vlm_{len(branches)}"), len(branches))
+                branches.append(actor)
+                all_results.append(actor.rollout.remote(
+                    BranchRequest(snapshot, actions, reward_region={"focal_id": focal_id}, horizon_s=args.horizon_s),
+                    branch_id))
+        results = ray.get(all_results)
+        print(json.dumps({"groups": {s.snapshot_id: sum(r["snapshot_id"] == s.snapshot_id for r in results)
+                                      for s in snapshots},
+                          "rewards": [r["reward"] for r in results]}, ensure_ascii=False))
+    finally:
+        if branches:
+            ray.get([actor.close.remote() for actor in branches])
+        ray.get([actor.close.remote() for actor in masters.values()])
+        ray.shutdown()
+
+
+if __name__ == "__main__":
+    main()
