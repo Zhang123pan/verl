@@ -18,7 +18,9 @@ SLOW_FIXED_COST = 0.0
 REASONING_FREE_TOKENS = 300
 REASONING_TAU = 400.0
 REASONING_MAX_LENGTH_PENALTY = 0.10
-FAST_DECISION_PENALTY = 0.05
+MODE_BONUS_WEIGHT = 0.05
+MODE_CONFIDENCE_CENTER = 5.0
+MODE_CONFIDENCE_TEMPERATURE = 2.0
 
 
 def _write_reward_log(record: dict[str, Any]) -> None:
@@ -254,6 +256,31 @@ def _reasoning_penalty(mode: str, reasoning: str) -> float:
     return SLOW_FIXED_COST + length_penalty
 
 
+def _mode_bonus(mode: str, perception_target: Any) -> tuple[float, float, float]:
+    """Reward fast/slow continuously from the ground-truth current-q gap."""
+    phase_rows = _phase_map(perception_target)
+    q_values = []
+    for phase in PHASES:
+        row = phase_rows.get(phase, {})
+        current_q = row.get("current_q", {}) if isinstance(row, dict) else {}
+        value = current_q.get("total") if isinstance(current_q, dict) else None
+        if not isinstance(value, (int, float)):
+            return 0.0, 0.0, 0.0
+        q_values.append(float(value))
+    ordered = sorted(q_values, reverse=True)
+    q_gap = max(0.0, ordered[0] - ordered[1])
+    fast_confidence = 1.0 / (
+        1.0 + math.exp(-(q_gap - MODE_CONFIDENCE_CENTER) / MODE_CONFIDENCE_TEMPERATURE)
+    )
+    if mode == "fast":
+        bonus = MODE_BONUS_WEIGHT * fast_confidence
+    elif mode == "slow":
+        bonus = MODE_BONUS_WEIGHT * (1.0 - fast_confidence)
+    else:
+        bonus = 0.0
+    return bonus, q_gap, fast_confidence
+
+
 def compute_score(solution_str, ground_truth, **kwargs):
     gt = _json(ground_truth) or {}
     solution = solution_str or ""
@@ -317,16 +344,11 @@ def compute_score(solution_str, ground_truth, **kwargs):
         phase: _traffic(gt, phase) for phase in PHASES
     } if isinstance(actions, dict) and set(actions) == set(PHASES) else {}
     best_traffic_reward = max(action_rewards.values(), default=traffic_reward)
-    # Fast is intended for an unambiguous quick decision.  Penalize only a
-    # strictly suboptimal fast action; ties for the best counterfactual remain
-    # valid. Slow already receives the natural traffic reward and is not
-    # double-penalized here.
-    fast_decision_penalty = (
-        FAST_DECISION_PENALTY
-        if output.get("mode") == "fast" and traffic_reward < best_traffic_reward
-        else 0.0
+    mode_bonus, q_gap, fast_confidence = _mode_bonus(
+        output.get("mode", ""), gt.get("perception_target")
     )
-    base_reward = traffic_reward + 0.5 * perception_reward - reasoning_penalty - fast_decision_penalty
+    fast_decision_penalty = 0.0
+    base_reward = traffic_reward + 0.5 * perception_reward + mode_bonus - reasoning_penalty
     format_term = -0.5 if not parsed else 0.0
     score = base_reward + format_term
     result = {
@@ -339,6 +361,9 @@ def compute_score(solution_str, ground_truth, **kwargs):
         "reasoning_penalty": reasoning_penalty,
         "best_traffic_reward": best_traffic_reward,
         "fast_decision_penalty": fast_decision_penalty,
+        "q_gap": q_gap,
+        "fast_confidence": fast_confidence,
+        "mode_bonus": mode_bonus,
         "perception_correct": correct,
         "perception_total": 44,
     }
