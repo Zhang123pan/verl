@@ -15,7 +15,7 @@ import ray
 from .city_env_config import build_city_env_configs
 from .city_scheduler import load_sampling_config
 from .ray_actors import BranchRequest, create_actor_classes
-from .sumo_adapter import MultiCityBranchAdapter, V30RecordingMasterFactory
+from .sumo_adapter import MultiCityBranchAdapter, SUMOEnvFactory, V30RecordingMasterFactory
 
 
 SIGNALS = {"ETWT", "NTST", "ELWL", "NLSL"}
@@ -27,7 +27,8 @@ def _data_url(path: str) -> str:
     return f"data:{mime};base64," + base64.b64encode(Path(path).read_bytes()).decode("ascii")
 
 
-def _query(api_url: str, api_key: str, model: str, videos: dict[str, str], timeout: float) -> str:
+def _query(api_url: str, api_key: str, model: str, videos: dict[str, str], timeout: float,
+           temperature: float) -> str:
     content = [{"type": "text", "text": (
         "Analyze this focal intersection using the four directional videos. "
         "Return only the required XML tags and choose one signal from ETWT, NTST, ELWL, NLSL."
@@ -36,7 +37,7 @@ def _query(api_url: str, api_key: str, model: str, videos: dict[str, str], timeo
         content.append({"type": "text", "text": f"Direction {direction}:"})
         content.append({"type": "video_url", "video_url": {"url": _data_url(videos[direction])}})
     payload = {"model": model, "messages": [{"role": "user", "content": content}],
-               "max_tokens": 1024, "temperature": 0}
+               "max_tokens": 1024, "temperature": temperature}
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -66,6 +67,7 @@ def main() -> None:
     parser.add_argument("--rollout-n", type=int, default=6)
     parser.add_argument("--horizon-s", type=int, default=30)
     parser.add_argument("--timeout", type=float, default=900)
+    parser.add_argument("--temperature", type=float, default=0.7)
     args = parser.parse_args()
     if args.api_config:
         private = json.loads(Path(args.api_config).read_text(encoding="utf-8"))
@@ -77,11 +79,12 @@ def main() -> None:
     cfg = load_sampling_config(args.config)
     cities = [x.strip().lower() for x in args.cities.split(",") if x.strip()]
     configs, paths = build_city_env_configs(args.repo_root, cfg.episode_seconds)
-    factory = V30RecordingMasterFactory(configs, paths, args.work_root, repo_root=args.repo_root)
+    master_factory = V30RecordingMasterFactory(configs, paths, args.work_root, repo_root=args.repo_root)
+    branch_factory = SUMOEnvFactory(configs, paths, args.work_root, repo_root=args.repo_root)
     ray.init(ignore_reinit_error=True)
     _Master, Branch, RotatingMaster = create_actor_classes()
     seed_map = {spec.name: list(spec.seeds) for spec in cfg.cities}
-    masters = {city: RotatingMaster.remote(factory, city, seed_map[city],
+    masters = {city: RotatingMaster.remote(master_factory, city, seed_map[city],
                                            str(Path(args.snapshot_dir) / city), cfg.episode_seconds)
                for city in cities}
     branches = []
@@ -93,14 +96,16 @@ def main() -> None:
             if not snapshot.observations:
                 raise RuntimeError("Snapshot has no V30 observations")
             focal_id, observation = sorted(snapshot.observations.items())[0]
-            raw = _query(args.api_url, args.api_key, args.model, observation.videos, args.timeout)
-            signal = _signal(raw)
-            actions = {inter_id: "ETWT" for inter_id in configs[snapshot.city]["INTER_PHASE_MAPPING"]}
-            actions[focal_id] = signal
-            print(json.dumps({"snapshot_id": snapshot.snapshot_id, "focal_id": focal_id,
-                              "signal": signal, "response": raw}, ensure_ascii=False))
             for branch_id in range(args.rollout_n):
-                actor = Branch.remote(partial(MultiCityBranchAdapter, factory, f"vlm_{len(branches)}"), len(branches))
+                raw = _query(args.api_url, args.api_key, args.model, observation.videos,
+                             args.timeout, args.temperature)
+                signal = _signal(raw)
+                actions = {inter_id: "ETWT" for inter_id in configs[snapshot.city]["INTER_PHASE_MAPPING"]}
+                actions[focal_id] = signal
+                print(json.dumps({"snapshot_id": snapshot.snapshot_id, "focal_id": focal_id,
+                                  "branch_id": branch_id, "signal": signal, "response": raw},
+                                 ensure_ascii=False))
+                actor = Branch.remote(partial(MultiCityBranchAdapter, branch_factory, f"vlm_{len(branches)}"), len(branches))
                 branches.append(actor)
                 all_results.append(actor.rollout.remote(
                     BranchRequest(snapshot, actions, reward_region={"focal_id": focal_id}, horizon_s=args.horizon_s),

@@ -351,7 +351,15 @@ class MultiCityBranchAdapter:
         return self.adapter.execute(actions, seconds)
 
     def compute_reward(self, region: dict[str, Any], result: dict[str, Any]) -> float:
-        return 0.0
+        focal_id = region.get("focal_id")
+        endpoint = result.get("endpoint") or {}
+        if not focal_id or focal_id not in endpoint:
+            return 0.0
+        stats = endpoint[focal_id]
+        return -(
+            float(stats.get("queue_150m", 0.0))
+            + 0.1 * float(stats.get("remaining_v_150m", 0.0))
+        )
 
     def close(self) -> None:
         if self.adapter is not None:
