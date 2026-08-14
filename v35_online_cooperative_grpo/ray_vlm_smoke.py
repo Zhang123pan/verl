@@ -16,6 +16,7 @@ from .city_env_config import build_city_env_configs
 from .city_scheduler import load_sampling_config
 from .ray_actors import BranchRequest, create_actor_classes
 from .sumo_adapter import MultiCityBranchAdapter, SUMOEnvFactory, V30RecordingMasterFactory
+from .trajectory import write_group_batch
 
 
 SIGNALS = {"ETWT", "NTST", "ELWL", "NLSL"}
@@ -96,6 +97,7 @@ def main() -> None:
     parser.add_argument("--horizon-s", type=int, default=30)
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--trajectory-output", default="")
     parser.add_argument(
         "--smoke-fallback",
         action="store_true",
@@ -126,6 +128,7 @@ def main() -> None:
         snapshots = ray.get([masters[city].advance_and_publish.remote(cfg.control_period_seconds)
                              for city in cities])
         all_results = []
+        trajectory_records = []
         for snapshot in snapshots:
             if not snapshot.observations:
                 raise RuntimeError("Snapshot has no V30 observations")
@@ -152,7 +155,24 @@ def main() -> None:
                 all_results.append(actor.rollout.remote(
                     BranchRequest(snapshot, actions, reward_region={"focal_id": focal_id}, horizon_s=args.horizon_s),
                     branch_id))
+                trajectory_records.append({
+                    "snapshot_id": snapshot.snapshot_id,
+                    "city": snapshot.city,
+                    "focal_id": focal_id,
+                    "branch_id": branch_id,
+                    "signal": signal,
+                    "fallback": fallback,
+                    "response": raw,
+                    "actions": actions,
+                })
         results = ray.get(all_results)
+        for record, result in zip(trajectory_records, results):
+            record["reward"] = float(result["reward"])
+            record["environment_result"] = result.get("environment_result", {})
+        if args.trajectory_output:
+            write_group_batch(args.trajectory_output, trajectory_records)
+            print(json.dumps({"trajectory_output": args.trajectory_output,
+                              "trajectory_records": len(trajectory_records)}, ensure_ascii=False))
         print(json.dumps({"groups": {s.snapshot_id: sum(r["snapshot_id"] == s.snapshot_id for r in results)
                                       for s in snapshots},
                           "rewards": [r["reward"] for r in results]}, ensure_ascii=False))
