@@ -6,8 +6,6 @@ import argparse
 import os
 from pathlib import Path
 
-import ray
-
 from .city_env_config import build_city_env_configs
 from .city_scheduler import CitySampler, load_sampling_config
 from .ray_actors import create_actor_classes
@@ -36,6 +34,10 @@ def main() -> None:
     # driver's physical device visibility for the renderer process.
     if args.record_observations:
         os.environ.setdefault("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
+    # Import Ray only after the visibility policy is fixed.  Ray caches parts
+    # of its accelerator setup during import, so setting this afterwards is
+    # too late for p3headlessgl actors.
+    import ray
     ray.init(ignore_reinit_error=True)
     _Master, _Branch, RotatingMaster = create_actor_classes()
     selected_names = [value.strip() for value in args.cities.split(",") if value.strip()]
