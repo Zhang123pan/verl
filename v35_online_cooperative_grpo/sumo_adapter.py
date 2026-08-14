@@ -7,6 +7,7 @@ kept outside this module until its design is finalised.
 
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -271,6 +272,9 @@ class V30RecordingMasterFactory(SUMOEnvFactory):
         model_dir.mkdir(parents=True, exist_ok=True)
         config = deepcopy(self.config_by_city[city])
         paths = deepcopy(self.paths_by_city[city])
+        rendering_backend = os.environ.get("V35_RENDERING_BACKEND", "p3headlessgl")
+        if rendering_backend not in {"p3headlessgl", "p3tinydisplay", "pandagl"}:
+            raise ValueError(f"Unsupported V35_RENDERING_BACKEND: {rendering_backend!r}")
         vlm_config = get_vlm_config(city)
         vlm_config.update({
             "DECISION_INPUT_MODE": "video",
@@ -284,7 +288,7 @@ class V30RecordingMasterFactory(SUMOEnvFactory):
             "VIDEO_SAVE_COORDINATION_FRAMES": True,
             "VIDEO_ASYNC_WRITE": False,
             "RENDER_PRESET": "1080P",
-            "RENDERING_BACKEND": "p3headlessgl",
+            "RENDERING_BACKEND": rendering_backend,
             "RENDER_KEEP_BATCH_SENSORS": False,
             "RENDER_REUSE_BATCH_SENSORS": True,
             "RENDER_STEP_TASK_MANAGER": False,
