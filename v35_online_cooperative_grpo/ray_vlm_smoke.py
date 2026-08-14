@@ -50,9 +50,9 @@ def _query(api_url: str, api_key: str, model: str, videos: dict[str, str], timeo
     return str(message.get("content") or message.get("reasoning_content") or "")
 
 
-def _signal(text: str) -> str:
+def _signal(text: str) -> str | None:
     match = re.search(r"<signal>\s*(ETWT|NTST|ELWL|NLSL)\s*</signal>", text, re.I)
-    return match.group(1).upper() if match else "ETWT"
+    return match.group(1).upper() if match else None
 
 
 def main() -> None:
@@ -70,6 +70,11 @@ def main() -> None:
     parser.add_argument("--horizon-s", type=int, default=30)
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument(
+        "--smoke-fallback",
+        action="store_true",
+        help="Use round-robin valid signals for invalid model output; smoke only.",
+    )
     args = parser.parse_args()
     if args.api_config:
         private = json.loads(Path(args.api_config).read_text(encoding="utf-8"))
@@ -102,10 +107,18 @@ def main() -> None:
                 raw = _query(args.api_url, args.api_key, args.model, observation.videos,
                              args.timeout, args.temperature)
                 signal = _signal(raw)
+                fallback = signal is None
+                if fallback:
+                    if not args.smoke_fallback:
+                        raise RuntimeError(
+                            f"Invalid VLM signal for branch {branch_id}: {raw[:500]!r}"
+                        )
+                    signal = ("ETWT", "NTST", "ELWL", "NLSL")[branch_id % 4]
                 actions = {inter_id: "ETWT" for inter_id in configs[snapshot.city]["INTER_PHASE_MAPPING"]}
                 actions[focal_id] = signal
                 print(json.dumps({"snapshot_id": snapshot.snapshot_id, "focal_id": focal_id,
-                                  "branch_id": branch_id, "signal": signal, "response": raw},
+                                  "branch_id": branch_id, "signal": signal,
+                                  "fallback": fallback, "response": raw},
                                  ensure_ascii=False))
                 actor = Branch.remote(partial(MultiCityBranchAdapter, branch_factory, f"vlm_{len(branches)}"), len(branches))
                 branches.append(actor)
