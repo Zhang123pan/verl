@@ -158,8 +158,14 @@ def main() -> None:
                           "rewards": [r["reward"] for r in results]}, ensure_ascii=False))
     finally:
         if branches:
-            ray.get([actor.close.remote() for actor in branches])
-        ray.get([actor.close.remote() for actor in masters.values()])
+            try:
+                ray.get([actor.close.remote() for actor in branches])
+            except ray.exceptions.RayError:
+                pass
+        try:
+            ray.get([actor.close.remote() for actor in masters.values()])
+        except ray.exceptions.RayError:
+            pass
         ray.shutdown()
 
 
