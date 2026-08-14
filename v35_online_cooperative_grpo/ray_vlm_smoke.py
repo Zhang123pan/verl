@@ -27,7 +27,7 @@ def _data_url(path: str) -> str:
     return f"data:{mime};base64," + base64.b64encode(Path(path).read_bytes()).decode("ascii")
 
 
-def _query(api_url: str, model: str, videos: dict[str, str], timeout: float) -> str:
+def _query(api_url: str, api_key: str, model: str, videos: dict[str, str], timeout: float) -> str:
     content = [{"type": "text", "text": (
         "Analyze this focal intersection using the four directional videos. "
         "Return only the required XML tags and choose one signal from ETWT, NTST, ELWL, NLSL."
@@ -37,8 +37,11 @@ def _query(api_url: str, model: str, videos: dict[str, str], timeout: float) -> 
         content.append({"type": "video_url", "video_url": {"url": _data_url(videos[direction])}})
     payload = {"model": model, "messages": [{"role": "user", "content": content}],
                "max_tokens": 1024, "temperature": 0}
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(api_url, data=json.dumps(payload).encode(),
-                                     headers={"Content-Type": "application/json"}, method="POST")
+                                     headers=headers, method="POST")
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = json.loads(response.read().decode())
     return str(body["choices"][0]["message"]["content"])
@@ -56,12 +59,21 @@ def main() -> None:
     parser.add_argument("--work-root", required=True)
     parser.add_argument("--snapshot-dir", required=True)
     parser.add_argument("--api-url", default="http://localhost:8088/v1/chat/completions")
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--api-key", default="")
+    parser.add_argument("--api-config", default="")
+    parser.add_argument("--model", default="")
     parser.add_argument("--cities", default="jinan")
     parser.add_argument("--rollout-n", type=int, default=6)
     parser.add_argument("--horizon-s", type=int, default=30)
     parser.add_argument("--timeout", type=float, default=900)
     args = parser.parse_args()
+    if args.api_config:
+        private = json.loads(Path(args.api_config).read_text(encoding="utf-8"))
+        args.api_url = private.get("api_url", args.api_url)
+        args.api_key = private.get("api_key", args.api_key)
+        args.model = private.get("model", args.model)
+    if not args.model:
+        parser.error("--model or api_config.model is required")
     cfg = load_sampling_config(args.config)
     cities = [x.strip().lower() for x in args.cities.split(",") if x.strip()]
     configs, paths = build_city_env_configs(args.repo_root, cfg.episode_seconds)
@@ -81,7 +93,7 @@ def main() -> None:
             if not snapshot.observations:
                 raise RuntimeError("Snapshot has no V30 observations")
             focal_id, observation = sorted(snapshot.observations.items())[0]
-            raw = _query(args.api_url, args.model, observation.videos, args.timeout)
+            raw = _query(args.api_url, args.api_key, args.model, observation.videos, args.timeout)
             signal = _signal(raw)
             actions = {inter_id: "ETWT" for inter_id in configs[snapshot.city]["INTER_PHASE_MAPPING"]}
             actions[focal_id] = signal
