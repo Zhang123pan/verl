@@ -15,7 +15,7 @@ import ray
 from .city_env_config import build_city_env_configs
 from .city_scheduler import load_sampling_config
 from .ray_actors import BranchRequest, create_actor_classes
-from .sumo_adapter import MultiCityBranchAdapter, SUMOEnvFactory
+from .sumo_adapter import MultiCityBranchAdapter, V30RecordingMasterFactory
 
 
 SIGNALS = {"ETWT", "NTST", "ELWL", "NLSL"}
@@ -65,7 +65,7 @@ def main() -> None:
     cfg = load_sampling_config(args.config)
     cities = [x.strip().lower() for x in args.cities.split(",") if x.strip()]
     configs, paths = build_city_env_configs(args.repo_root, cfg.episode_seconds)
-    factory = SUMOEnvFactory(configs, paths, args.work_root, repo_root=args.repo_root)
+    factory = V30RecordingMasterFactory(configs, paths, args.work_root, repo_root=args.repo_root)
     ray.init(ignore_reinit_error=True)
     _Master, Branch, RotatingMaster = create_actor_classes()
     seed_map = {spec.name: list(spec.seeds) for spec in cfg.cities}
