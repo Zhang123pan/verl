@@ -44,6 +44,18 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
     params["temperature"] = 0
 
 
+def _is_cooperative_output_group(outputs: list[AgentLoopOutput]) -> bool:
+    """Validate and identify a pre-scored cooperative span group."""
+    marked = [output.extra_fields.get("cooperative_advantage") is not None for output in outputs]
+    if any(marked) and not all(marked):
+        raise ValueError("cannot mix cooperative and ordinary outputs in one agent-loop result")
+    if not all(marked):
+        return False
+    if any(output.reward_score is None for output in outputs):
+        raise ValueError("every cooperative output must carry its branch reward")
+    return True
+
+
 async def _settle_session_tasks(tasks: list[asyncio.Task[Any]]) -> list[BaseException]:
     results = await asyncio.gather(*tasks, return_exceptions=True)
     return [result for result in results if isinstance(result, BaseException)]
@@ -160,7 +172,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         extra_info = dict(kwargs.get("extra_info") or {})
         extra_info["split"] = "val" if validate else "train"
         kwargs["extra_info"] = extra_info
-        await self._compute_score(outputs, kwargs=kwargs)
+        cooperative_group = _is_cooperative_output_group(outputs)
+        if not cooperative_group:
+            await self._compute_score(outputs, kwargs=kwargs)
 
         final_output = outputs[-1]
         # TODO: Support output:list[AgentLoopOutput]
@@ -172,7 +186,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             sample_kwargs=kwargs,
         )
 
-        if final_output.reward_score is not None:
+        if final_output.reward_score is not None and not cooperative_group:
             for output in outputs[:-1]:
                 output.reward_score = final_output.reward_score
                 output.extra_fields["reward_extra_info"] = final_output.extra_fields["reward_extra_info"]
