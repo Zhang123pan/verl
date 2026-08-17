@@ -16,6 +16,7 @@ import ray
 from .city_env_config import build_city_env_configs
 from .city_scheduler import load_sampling_config
 from .ray_actors import BranchRequest, create_actor_classes
+from .decision_parser import resolve_decision
 from .message_router import (
     MessageProtocolError,
     parse_sender_message,
@@ -83,11 +84,6 @@ def _query(api_url: str, api_key: str, model: str, videos: dict[str, str], timeo
     return str(message.get("content") or message.get("reasoning_content") or "")
 
 
-def _signal(text: str) -> str | None:
-    match = re.search(r"<signal>\s*(ETWT|NTST|ELWL|NLSL)\s*</signal>", text, re.I)
-    return match.group(1).upper() if match else None
-
-
 def _route_table(city: str) -> dict:
     path = Path(__file__).with_name("artifacts") / f"movement_routes_{city}.json"
     return json.loads(path.read_text(encoding="utf-8"))
@@ -151,35 +147,27 @@ def main() -> None:
             route_table = _route_table(snapshot.city)
             focal_id = select_sender(set(snapshot.observations), route_table, args.focal_id)
             observation = snapshot.observations[focal_id]
+            if not snapshot.background_actions:
+                raise RuntimeError(f"Snapshot {snapshot.snapshot_id} has no V25 background actions")
             for branch_id in range(args.rollout_n):
                 sender_prompt = build_sender_prompt(_base_messages(prompt_template, focal_id))
                 raw = _query(args.api_url, args.api_key, args.model, observation.videos,
                              args.timeout, args.temperature, sender_prompt)
-                signal = _signal(raw)
-                sender_signal_valid = signal is not None
+                v25_signal = snapshot.background_actions.get(focal_id)
+                decision = resolve_decision(raw, v25_signal)
+                signal = decision.signal
+                sender_signal_valid = decision.signal_source == "model_signal"
                 sender_message_valid = False
-                fallback = signal is None
+                fallback = decision.signal_source == "v25_fallback"
                 routed = []
-                if fallback:
-                    if not args.smoke_fallback:
-                        raise RuntimeError(
-                            f"Invalid VLM signal for branch {branch_id}: {raw[:500]!r}"
-                        )
-                    signal = ("ETWT", "NTST", "ELWL", "NLSL")[branch_id % 4]
-                else:
-                    try:
-                        parsed_messages = parse_sender_message(raw, selected_signal=signal)
-                        routed = route_messages(focal_id, parsed_messages, route_table)
-                        sender_message_valid = True
-                    except (MessageProtocolError, KeyError, ValueError) as error:
-                        if not args.smoke_fallback:
-                            raise RuntimeError(
-                                f"Invalid sender message for branch {branch_id}: {error}"
-                            ) from error
-                        fallback = True
-
-                if not snapshot.background_actions:
-                    raise RuntimeError(f"Snapshot {snapshot.snapshot_id} has no V25 background actions")
+                try:
+                    parsed_messages = parse_sender_message(raw, selected_signal=signal)
+                    routed = route_messages(focal_id, parsed_messages, route_table)
+                    sender_message_valid = True
+                except (MessageProtocolError, KeyError, ValueError):
+                    # A message is coordination-only: retain a valid selected signal
+                    # and simply give receivers no model override this cycle.
+                    pass
                 actions = dict(snapshot.background_actions)
                 actions[focal_id] = signal
                 receiver_contexts = render_receiver_message_context(routed)
@@ -195,21 +183,19 @@ def main() -> None:
                         args.api_url, args.api_key, args.model, receiver_observation.videos,
                         args.timeout, args.temperature, receiver_prompt,
                     )
-                    receiver_signal = _signal(receiver_raw)
-                    receiver_fallback = receiver_signal is None
-                    if receiver_fallback:
-                        if not args.smoke_fallback:
-                            raise RuntimeError(
-                                f"Invalid receiver {receiver_id} signal for branch {branch_id}: "
-                                f"{receiver_raw[:500]!r}"
-                            )
-                        receiver_signal = "ETWT"
-                        fallback = True
+                    receiver_decision = resolve_decision(
+                        receiver_raw, snapshot.background_actions[receiver_id]
+                    )
+                    receiver_signal = receiver_decision.signal
+                    receiver_fallback = receiver_decision.signal_source == "v25_fallback"
+                    fallback = fallback or receiver_fallback
                     actions[receiver_id] = receiver_signal
                     receiver_records.append({
                         "intersection_id": receiver_id,
                         "signal": receiver_signal,
                         "fallback": receiver_fallback,
+                        "perception_valid": receiver_decision.perception_valid,
+                        "perception_error": receiver_decision.perception_error,
                         "response": receiver_raw,
                         "prompt": receiver_prompt,
                         "videos": dict(receiver_observation.videos),
@@ -239,6 +225,8 @@ def main() -> None:
                     "signal": signal,
                     "sender_signal_valid": sender_signal_valid,
                     "sender_message_valid": sender_message_valid,
+                    "perception_valid": decision.perception_valid,
+                    "perception_error": decision.perception_error,
                     "fallback": fallback,
                     "response": raw,
                     "prompt": sender_prompt,
