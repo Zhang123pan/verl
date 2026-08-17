@@ -17,6 +17,30 @@ from .ray_actors import SnapshotRef
 from .observation import V30Observation
 
 
+def cooperative_region_reward(region: dict[str, Any], result: dict[str, Any]) -> float:
+    """Average endpoint congestion cost over the sender and routed receivers."""
+    focal_id = region.get("focal_id")
+    endpoint = result.get("endpoint") or {}
+    if not focal_id or focal_id not in endpoint:
+        return 0.0
+    receiver_ids = region.get("receiver_ids") or ()
+    intersection_ids = list(
+        dict.fromkeys(
+            intersection_id
+            for intersection_id in (focal_id, *receiver_ids)
+            if intersection_id in endpoint
+        )
+    )
+    costs = []
+    for intersection_id in intersection_ids:
+        stats = endpoint[intersection_id]
+        costs.append(
+            float(stats.get("queue_150m", 0.0))
+            + 0.1 * float(stats.get("remaining_v_150m", 0.0))
+        )
+    return -sum(costs) / len(costs)
+
+
 def _phase_vehicle_count(intersection: Any, phase: str) -> int:
     """Match V30's 150m Current V accounting for a controlled phase."""
     movements = [phase[i : i + 2] for i in range(0, len(phase), 2)]
@@ -48,11 +72,13 @@ class SUMOEnvAdapter:
         self.env = env
         self.seed = seed
         self.v25 = V25State()
+        self._pending_background_actions: dict[str, str] | None = None
 
     def reset(self, seed: int | None = None) -> None:
         self.seed = self.seed if seed is None else int(seed)
         self.env.reset(use_gui=False, seed=self.seed, verbose=False)
         self.v25 = V25State()
+        self._pending_background_actions = None
 
     def close(self) -> None:
         self.env.close()
@@ -121,6 +147,9 @@ class SUMOEnvAdapter:
             }
         return result
 
+    def compute_reward(self, region: dict[str, Any], result: dict[str, Any]) -> float:
+        return cooperative_region_reward(region, result)
+
     def background_actions(self) -> dict[str, str]:
         """Repository V25 rule: Current V > V35-V > nonzero history > order."""
         actions = {}
@@ -139,8 +168,19 @@ class SUMOEnvAdapter:
             histories[selected] = []
         return actions
 
+    def planned_background_actions(self) -> dict[str, str]:
+        """Plan V25 once for the current state and retain it for timeline advance."""
+        if self._pending_background_actions is None:
+            self._pending_background_actions = self.background_actions()
+        return dict(self._pending_background_actions)
+
+    def _consume_background_actions(self) -> dict[str, str]:
+        actions = self.planned_background_actions()
+        self._pending_background_actions = None
+        return actions
+
     def advance_background(self, seconds: int) -> None:
-        self.execute(self.background_actions(), seconds)
+        self.execute(self._consume_background_actions(), seconds)
 
     def observations(self) -> dict[str, Any] | None:
         """Bare SUMO smoke adapters do not own the V30 renderer/recorder."""
@@ -161,12 +201,13 @@ class V30RecordingMasterAdapter(SUMOEnvAdapter):
         self.env.reset(use_gui=False, seed=self.seed, verbose=False)
         self.runtime._reset_perception_renderer()
         self.v25 = V25State()
+        self._pending_background_actions = None
         self.decision_step = 0
         self._observations = {}
 
     def advance_background(self, seconds: int) -> None:
         start_s = float(self.env.get_current_time())
-        actions = self.background_actions()
+        actions = self._consume_background_actions()
         self.runtime._begin_video_interval(self.decision_step, start_s)
         try:
             self.env.step(
@@ -351,15 +392,7 @@ class MultiCityBranchAdapter:
         return self.adapter.execute(actions, seconds)
 
     def compute_reward(self, region: dict[str, Any], result: dict[str, Any]) -> float:
-        focal_id = region.get("focal_id")
-        endpoint = result.get("endpoint") or {}
-        if not focal_id or focal_id not in endpoint:
-            return 0.0
-        stats = endpoint[focal_id]
-        return -(
-            float(stats.get("queue_150m", 0.0))
-            + 0.1 * float(stats.get("remaining_v_150m", 0.0))
-        )
+        return cooperative_region_reward(region, result)
 
     def close(self) -> None:
         if self.adapter is not None:

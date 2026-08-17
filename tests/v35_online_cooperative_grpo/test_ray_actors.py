@@ -13,3 +13,14 @@ def test_branch_request_is_snapshot_scoped():
     assert req.snapshot.snapshot_id == "ep1_t00000000"
     assert req.horizon_s == 30
     assert req.snapshot.seed == 7
+
+
+def test_snapshot_background_actions_can_be_shared_without_mutation():
+    ref = SnapshotRef(
+        "jinan", "ep1", "ep1_t00000000", "/shared/s.xml", 0.0, 7,
+        background_actions={"a": "ETWT", "b": "NTST"},
+    )
+    first = dict(ref.background_actions)
+    second = dict(ref.background_actions)
+    first["a"] = "ELWL"
+    assert second == {"a": "ETWT", "b": "NTST"}

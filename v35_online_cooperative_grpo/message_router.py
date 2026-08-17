@@ -107,3 +107,28 @@ def render_receiver_message_context(routed_messages: list[RoutedMessage]) -> dic
             ])
         rendered[receiver_id] = "\n".join(lines)
     return rendered
+
+
+def select_sender(
+    observation_ids: set[str], route_table: dict[str, Any], requested_id: str = ""
+) -> str:
+    """Choose a reproducible sender with the largest usable routing neighborhood."""
+    routes = route_table.get("routes") or {}
+    if requested_id:
+        if requested_id not in observation_ids:
+            raise ValueError(f"Requested focal intersection has no observation: {requested_id}")
+        if requested_id not in routes:
+            raise ValueError(f"Requested focal intersection has no route entry: {requested_id}")
+        return requested_id
+    candidates = []
+    for intersection_id in sorted(observation_ids):
+        movement_routes = (routes.get(intersection_id) or {}).get("movements") or {}
+        usable_receivers = {
+            route.get("receiver_id")
+            for route in movement_routes.values()
+            if not route.get("is_boundary") and route.get("receiver_id") in observation_ids
+        }
+        candidates.append((len(usable_receivers), intersection_id))
+    if not candidates:
+        raise ValueError("Cannot select a sender without observations")
+    return max(candidates, key=lambda item: (item[0], item[1]))[1]

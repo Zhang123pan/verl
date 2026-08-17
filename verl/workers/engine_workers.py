@@ -33,7 +33,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
+from verl.utils.device import get_device_id, get_device_name, get_torch_device, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
@@ -287,6 +287,31 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 maybe_fix_3d_position_ids(mini_batch_td)
+                segmented_masks = ("grpo_loss_mask", "perception_sft_mask", "kl_loss_mask")
+                if any(key in mini_batch_td for key in segmented_masks):
+                    if not all(key in mini_batch_td for key in segmented_masks):
+                        raise ValueError("incomplete segmented actor-loss masks")
+                    for mask_key in segmented_masks:
+                        mask = mini_batch_td[mask_key]
+                        token_count = mask.sum().to(get_device_id())
+                        sequence_count = mask.to(bool).any(dim=-1).sum().to(get_device_id())
+                        torch.distributed.all_reduce(
+                            token_count,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=self.engine.get_data_parallel_group(),
+                        )
+                        torch.distributed.all_reduce(
+                            sequence_count,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=self.engine.get_data_parallel_group(),
+                        )
+                        tu.assign_non_tensor(
+                            mini_batch_td,
+                            **{
+                                f"{mask_key}_num_tokens": token_count.item(),
+                                f"{mask_key}_num_sequences": sequence_count.item(),
+                            },
+                        )
                 # add global token num
                 if "input_ids" in mini_batch_td:
                     global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)

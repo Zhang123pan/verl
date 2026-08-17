@@ -13,14 +13,12 @@ Your response must use exactly one of these valid layouts:
 Fast mode:
 <perception>...</perception>
 <mode>fast</mode>
-<current_v>...</current_v>
 <signal>...</signal>
 
 Slow mode:
 <perception>...</perception>
 <mode>slow</mode>
 <reasoning>...</reasoning>
-<current_v>...</current_v>
 <signal>...</signal>
 
 Do not output any text before the first tag or after the last tag.
@@ -35,7 +33,6 @@ Your response must use exactly one of these valid layouts:
 Fast mode:
 <perception>...</perception>
 <mode>fast</mode>
-<current_v>...</current_v>
 <signal>...</signal>
 <message>...</message>
 
@@ -43,7 +40,6 @@ Slow mode:
 <perception>...</perception>
 <mode>slow</mode>
 <reasoning>...</reasoning>
-<current_v>...</current_v>
 <signal>...</signal>
 <message>...</message>
 

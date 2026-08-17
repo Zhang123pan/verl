@@ -135,6 +135,102 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+_PERCEPTION_SFT_SOURCE_KEYS = (
+    "perception_sft_responses",
+    "perception_sft_input_ids",
+    "perception_sft_attention_mask",
+    "perception_sft_position_ids",
+)
+_PERCEPTION_SFT_ROLLOUT_AUX_KEYS = (
+    *_PERCEPTION_SFT_SOURCE_KEYS,
+    "grpo_loss_mask",
+    "perception_sft_mask",
+)
+
+
+def _drop_perception_sft_rollout_aux(data) -> None:
+    """Remove actor-only auxiliary tensors from inference/critic batch copies."""
+    for key in _PERCEPTION_SFT_ROLLOUT_AUX_KEYS:
+        if key in data:
+            data.pop(key)
+
+
+def _append_perception_sft_rows(data: DataProto, rollout_n: int) -> DataProto:
+    """Add one gold perception-only row after each GRPO prompt group.
+
+    The added rows are actor-only supervised examples. They are inserted after
+    their corresponding rollout group so every prompt-based actor mini-batch
+    contains both GRPO and gold tokens. They are created after
+    advantages and reference log-probabilities have been computed, and their
+    policy/KL masks are zero, so they cannot enter the GRPO estimator.
+    """
+    required = {
+        "grpo_loss_mask",
+        "perception_sft_mask",
+        *_PERCEPTION_SFT_SOURCE_KEYS,
+    }
+    missing = required.difference(data.batch.keys())
+    if missing:
+        raise ValueError(f"perception SFT is enabled but rollout output is missing {sorted(missing)}")
+    if "uid" not in data.non_tensor_batch:
+        raise ValueError("perception SFT requires uid groups")
+    if "routed_experts" in data.batch:
+        raise ValueError("perception SFT is not compatible with rollout routing replay")
+    if "teacher_logprobs" in data.batch or "teacher_ids" in data.batch:
+        raise ValueError("perception SFT is not compatible with top-k distillation")
+
+    from v35_offline_grpo.perception_sft import build_perception_sft_row_indices
+
+    gold_indices_list, interleaved_indices_list = build_perception_sft_row_indices(
+        data.non_tensor_batch["uid"], rollout_n
+    )
+    gold_indices = np.asarray(gold_indices_list, dtype=np.int64)
+    interleaved_indices = np.asarray(interleaved_indices_list, dtype=np.int64)
+    rollout_batch = data.batch.clone()
+    gold_batch = data.batch[torch.from_numpy(gold_indices)].clone()
+
+    gold_batch["responses"] = gold_batch["perception_sft_responses"]
+    gold_batch["input_ids"] = gold_batch["perception_sft_input_ids"]
+    gold_batch["attention_mask"] = gold_batch["perception_sft_attention_mask"]
+    gold_batch["position_ids"] = gold_batch["perception_sft_position_ids"]
+    gold_batch["response_mask"] = gold_batch["perception_sft_mask"]
+
+    rollout_response_mask = rollout_batch["response_mask"]
+    rollout_batch["kl_loss_mask"] = rollout_response_mask.clone()
+    rollout_batch["perception_sft_mask"] = torch.zeros_like(rollout_batch["perception_sft_mask"])
+    gold_batch["grpo_loss_mask"] = torch.zeros_like(gold_batch["grpo_loss_mask"])
+    gold_batch["kl_loss_mask"] = torch.zeros_like(gold_batch["response_mask"])
+
+    # These tensors describe sampled actions. Keep their shapes for TensorDict
+    # concatenation, but make the actor-only gold rows inert for every RL term.
+    for key in (
+        "old_log_probs",
+        "advantages",
+        "ref_log_prob",
+        "rollout_log_probs",
+        "rollout_is_weights",
+        "token_level_scores",
+        "token_level_rewards",
+        "returns",
+        "values",
+        "rm_scores",
+    ):
+        if key in gold_batch:
+            gold_batch[key] = torch.zeros_like(gold_batch[key])
+
+    for key in _PERCEPTION_SFT_SOURCE_KEYS:
+        rollout_batch.pop(key)
+        gold_batch.pop(key)
+
+    combined_batch = torch.cat([rollout_batch, gold_batch], dim=0)
+    combined_batch = combined_batch[torch.from_numpy(interleaved_indices)]
+    combined_non_tensor = {
+        key: np.concatenate((value, value[gold_indices]), axis=0)[interleaved_indices]
+        for key, value in data.non_tensor_batch.items()
+    }
+    return DataProto(batch=combined_batch, non_tensor_batch=combined_non_tensor, meta_info=dict(data.meta_info))
+
+
 def compute_spec_decode_metrics(
     spec_drafts,
     spec_accepts,
@@ -1226,6 +1322,7 @@ class RayPPOTrainer:
 
     def _compute_values(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()
+        _drop_perception_sft_rollout_aux(batch_td)
         # step 2: convert from padding to nopadding
         batch_td = left_right_2_no_padding(batch_td)
         # step 3: add meta info
@@ -1241,6 +1338,7 @@ class RayPPOTrainer:
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
         # step 1: convert dataproto to tensordict.
         batch_td = batch.to_tensordict()
+        _drop_perception_sft_rollout_aux(batch_td)
         # step 2: convert from padding to nopadding
         batch_td = left_right_2_no_padding(batch_td)
         # step 3: add meta info
@@ -1266,6 +1364,7 @@ class RayPPOTrainer:
         # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
         # step 1: convert dataproto to tensordict.
         batch_td = batch.to_tensordict()
+        _drop_perception_sft_rollout_aux(batch_td)
         # step 2: convert from padding to nopadding
         batch_td = left_right_2_no_padding(batch_td)
         # step 3: add meta info
@@ -1301,6 +1400,14 @@ class RayPPOTrainer:
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
+        perception_sft_coef = float(os.environ.get("V35_PERCEPTION_SFT_COEF", "0"))
+        if perception_sft_coef > 0.0:
+            if self.config.actor_rollout_ref.actor.shuffle:
+                raise ValueError(
+                    "perception SFT requires actor_rollout_ref.actor.shuffle=False "
+                    "to keep each rollout group adjacent to its gold row"
+                )
+            batch = _append_perception_sft_rows(batch, rollout_n=rollout_config.n)
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
@@ -1325,7 +1432,8 @@ class RayPPOTrainer:
                 and not distillation_loss_cfg.use_policy_gradient
             )
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        samples_per_prompt = rollout_config.n + (1 if perception_sft_coef > 0.0 else 0)
+        ppo_mini_batch_size = ppo_mini_batch_size * samples_per_prompt
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle

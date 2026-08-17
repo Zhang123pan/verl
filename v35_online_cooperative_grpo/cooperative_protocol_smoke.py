@@ -55,7 +55,6 @@ def main() -> None:
     response = f"""<perception>{{"candidate_phases": []}}</perception>
 <mode>slow</mode>
 <reasoning>Smoke protocol message.</reasoning>
-<current_v>{{"ETWT": 3, "NTST": 1, "ELWL": 0, "NLSL": 0}}</current_v>
 <signal>{selected_signal}</signal>
 <message>
 {message_lines}

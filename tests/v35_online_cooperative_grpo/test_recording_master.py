@@ -39,3 +39,20 @@ def test_recording_master_attaches_six_frame_v30_window(tmp_path):
     assert observation.sim_start_s == 0
     assert observation.sim_end_s == 30
     assert set(observation.videos) == {"E", "W", "N", "S"}
+
+
+def test_planned_v25_actions_are_reused_by_next_advance(tmp_path):
+    adapter = V30RecordingMasterAdapter(Runtime(tmp_path), seed=1)
+    calls = 0
+    original = adapter.background_actions
+
+    def counted_background_actions():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    adapter.background_actions = counted_background_actions
+    planned = adapter.planned_background_actions()
+    assert adapter.planned_background_actions() == planned
+    adapter.advance_background(30)
+    assert calls == 1

@@ -18,9 +18,13 @@ SLOW_FIXED_COST = 0.0
 REASONING_FREE_TOKENS = 300
 REASONING_TAU = 400.0
 REASONING_MAX_LENGTH_PENALTY = 0.10
-MODE_BONUS_WEIGHT = 0.05
+MODE_BONUS_WEIGHT = 0.10
 MODE_CONFIDENCE_CENTER = 5.0
 MODE_CONFIDENCE_TEMPERATURE = 2.0
+PERCEPTION_SPLIT_WEIGHTING = os.environ.get("V35_PERCEPTION_SPLIT_WEIGHTING", "1") == "1"
+# Perception is optimized by a gold-token CE auxiliary loss. Keep all
+# perception diagnostics below, but do not place them in the GRPO scalar.
+PERCEPTION_REWARD_WEIGHT = 0.0
 
 
 def _write_reward_log(record: dict[str, Any]) -> None:
@@ -116,7 +120,18 @@ def _valid_phase_row(row: Any, phase: str) -> bool:
         return False
     if not 0 <= current_q["total"] <= current_v["total"]:
         return False
-    return coordinated["total"] >= 0
+    breakdown = coordinated.get("breakdown")
+    if not isinstance(breakdown, dict) or coordinated["total"] < 0:
+        return False
+    for movement in movements:
+        entry = breakdown.get(movement)
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("count"), (int, float))
+            or entry.get("is_boundary") not in ("yes", "no")
+        ):
+            return False
+    return True
 
 
 def _format(solution: str) -> tuple[bool, bool, dict[str, Any]]:
@@ -197,13 +212,8 @@ def _traffic(ground_truth: dict[str, Any], signal: str) -> float:
     return (v[signal] + q[signal] + d[signal]) / 3.0
 
 
-def _perception_values(value: Any) -> list[float]:
-    """Flatten the 11 scored values for each of the four phase rows (44 total).
-
-    ``is_boundary`` is intentionally excluded.  The two movement entries in
-    each current_v/current_q group and the two movement counts in
-    coordinated_arrivals are the two breakdown values for that phase.
-    """
+def _traffic_state_values(value: Any) -> list[float]:
+    """Flatten 11 traffic-state values per phase (44 values total)."""
     phases = _phase_map(value)
     if len(phases) != 4:
         return []
@@ -227,8 +237,133 @@ def _perception_values(value: Any) -> list[float]:
     return result
 
 
+def _auxiliary_perception_values(value: Any) -> tuple[list[str], list[float]]:
+    """Return the eight boundary labels and four persistent-history values."""
+    phases = _phase_map(value)
+    if len(phases) != 4:
+        return [], []
+    boundaries: list[str] = []
+    histories: list[float] = []
+    for phase in PHASES:
+        row = phases.get(phase)
+        if not isinstance(row, dict):
+            return [], []
+        try:
+            history = row["nonzero_v_history_length_since_last_service"]
+            breakdown = row["coordinated_arrivals"]["breakdown"]
+            if not isinstance(history, (int, float)):
+                return [], []
+            histories.append(float(history))
+            for movement in MOVEMENTS[phase]:
+                boundary = breakdown[movement]["is_boundary"]
+                if boundary not in ("yes", "no"):
+                    return [], []
+                boundaries.append(boundary)
+        except (KeyError, TypeError):
+            return [], []
+    return boundaries, histories
+
+
+def _perception_components(prediction: Any, target: Any) -> dict[str, float | int] | None:
+    """Score 44 traffic fields plus eight prepared auxiliary target fields.
+
+    Numeric traffic fields use a smooth distance score.  This preserves the
+    distinction between a near miss and an all-zero prediction, while the
+    auxiliary categorical/exact fields remain strict accuracies.
+    """
+    predicted_traffic = _traffic_state_values(prediction)
+    target_traffic = _traffic_state_values(target)
+    predicted_boundaries, predicted_history = _auxiliary_perception_values(prediction)
+    target_boundaries, target_history = _auxiliary_perception_values(target)
+    if (
+        len(predicted_traffic) != 44
+        or len(target_traffic) != 44
+        or len(predicted_boundaries) != 8
+        or len(target_boundaries) != 8
+        or len(predicted_history) != 4
+        or len(target_history) != 4
+    ):
+        return None
+
+    nonzero_matches = [
+        predicted == expected
+        for predicted, expected in zip(predicted_traffic, target_traffic)
+        if expected != 0
+    ]
+    zero_matches = [
+        predicted == expected
+        for predicted, expected in zip(predicted_traffic, target_traffic)
+        if expected == 0
+    ]
+    nonzero_distances = [
+        1.0 / (abs(predicted - expected) + 1.0)
+        for predicted, expected in zip(predicted_traffic, target_traffic)
+        if expected != 0
+    ]
+    zero_distances = [
+        1.0 / (abs(predicted - expected) + 1.0)
+        for predicted, expected in zip(predicted_traffic, target_traffic)
+        if expected == 0
+    ]
+    # Keep exact accuracies for diagnostics, but use smooth distance scores for
+    # the optimization signal.  +1 makes an exact match 1.0 and avoids division
+    # by zero; it does not introduce a +/-1 tolerance.
+    nonzero_accuracy = sum(nonzero_matches) / len(nonzero_matches) if nonzero_matches else None
+    zero_accuracy = sum(zero_matches) / len(zero_matches) if zero_matches else None
+    nonzero_distance_score = sum(nonzero_distances) / len(nonzero_distances) if nonzero_distances else None
+    zero_distance_score = sum(zero_distances) / len(zero_distances) if zero_distances else None
+    if not PERCEPTION_SPLIT_WEIGHTING:
+        all_distance_scores = nonzero_distances + zero_distances
+        traffic_state_score = (
+            sum(all_distance_scores) / len(all_distance_scores)
+            if all_distance_scores else 0.0
+        )
+    elif nonzero_distance_score is None:
+        traffic_state_score = float(zero_distance_score) if zero_distance_score is not None else 0.0
+    elif zero_distance_score is None:
+        traffic_state_score = float(nonzero_distance_score)
+    else:
+        traffic_state_score = 0.8 * nonzero_distance_score + 0.2 * zero_distance_score
+
+    boundary_matches = [predicted == expected for predicted, expected in zip(predicted_boundaries, target_boundaries)]
+    history_matches = [predicted == expected for predicted, expected in zip(predicted_history, target_history)]
+    boundary_accuracy = sum(boundary_matches) / len(boundary_matches)
+    history_accuracy = sum(history_matches) / len(history_matches)
+    perception_reward = (
+        0.90 * traffic_state_score
+        + 0.05 * boundary_accuracy
+        + 0.05 * history_accuracy
+    )
+    return {
+        "perception_reward": perception_reward,
+        "traffic_state_score": traffic_state_score,
+        "perception_nonzero_accuracy": nonzero_accuracy if nonzero_accuracy is not None else zero_accuracy,
+        "perception_zero_accuracy": zero_accuracy if zero_accuracy is not None else nonzero_accuracy,
+        "perception_nonzero_distance_score": (
+            nonzero_distance_score if nonzero_distance_score is not None else zero_distance_score
+        ),
+        "perception_zero_distance_score": (
+            zero_distance_score if zero_distance_score is not None else nonzero_distance_score
+        ),
+        "perception_nonzero_correct": sum(nonzero_matches),
+        "perception_nonzero_total": len(nonzero_matches),
+        "perception_zero_correct": sum(zero_matches),
+        "perception_zero_total": len(zero_matches),
+        "boundary_correct": sum(boundary_matches),
+        "boundary_total": len(boundary_matches),
+        "boundary_exact_accuracy": boundary_accuracy,
+        "history_correct": sum(history_matches),
+        "history_total": len(history_matches),
+        "history_exact_accuracy": history_accuracy,
+        "perception_correct": sum(nonzero_matches) + sum(zero_matches) + sum(boundary_matches) + sum(history_matches),
+        "perception_total": 56,
+    }
+
+
 def _perception_bad(solution: str, perception_obj: Any) -> bool:
-    if len(_perception_values(perception_obj)) != 44:
+    traffic_values = _traffic_state_values(perception_obj)
+    boundaries, histories = _auxiliary_perception_values(perception_obj)
+    if len(traffic_values) != 44 or len(boundaries) != 8 or len(histories) != 4:
         return True
     perception_blocks = _tag(solution, "perception")
     return len(perception_blocks) != 1
@@ -281,6 +416,50 @@ def _mode_bonus(mode: str, perception_target: Any) -> tuple[float, float, float]
     return bonus, q_gap, fast_confidence
 
 
+def _invalid_result(reasoning_penalty: float, perception_target: Any) -> dict[str, float | int]:
+    """Return a complete numeric result for malformed model output.
+
+    Validation aggregates every reward-extra key across samples.  Returning
+    the same schema on format failures prevents missing values from becoming
+    ``None`` during metric aggregation.
+    """
+    target_values = _traffic_state_values(perception_target)
+    nonzero_total = sum(value != 0 for value in target_values)
+    zero_total = len(target_values) - nonzero_total
+    return {
+        "score": -1.0,
+        "format_reward": 0.0,
+        "format_term": -1.0,
+        "base_reward": 0.0,
+        "traffic_reward": 0.0,
+        "perception_reward": 0.0,
+        "perception_reward_weight": PERCEPTION_REWARD_WEIGHT,
+        "reasoning_penalty": float(reasoning_penalty),
+        "best_traffic_reward": 0.0,
+        "fast_decision_penalty": 0.0,
+        "q_gap": 0.0,
+        "fast_confidence": 0.0,
+        "mode_bonus": 0.0,
+        "traffic_state_score": 0.0,
+        "perception_nonzero_accuracy": 0.0,
+        "perception_zero_accuracy": 0.0,
+        "perception_nonzero_distance_score": 0.0,
+        "perception_zero_distance_score": 0.0,
+        "perception_nonzero_correct": 0,
+        "perception_nonzero_total": nonzero_total,
+        "perception_zero_correct": 0,
+        "perception_zero_total": zero_total,
+        "boundary_correct": 0,
+        "boundary_total": 8,
+        "boundary_exact_accuracy": 0.0,
+        "history_correct": 0,
+        "history_total": 4,
+        "history_exact_accuracy": 0.0,
+        "perception_correct": 0,
+        "perception_total": 56,
+    }
+
+
 def compute_score(solution_str, ground_truth, **kwargs):
     gt = _json(ground_truth) or {}
     solution = solution_str or ""
@@ -295,13 +474,7 @@ def compute_score(solution_str, ground_truth, **kwargs):
     reasoning_penalty = _reasoning_penalty(mode, reasoning)
 
     if signal_bad:
-        result = {
-            "score": -1.0,
-            "format_reward": 0.0,
-            "traffic_reward": 0.0,
-            "perception_reward": 0.0,
-            "reasoning_penalty": reasoning_penalty,
-        }
+        result = _invalid_result(reasoning_penalty, gt.get("perception_target"))
         _write_reward_log({"split": split, "sample_id": sample_id, "solution": solution,
                            "ground_truth": gt, "parsed": parsed, "mode": output.get("mode"),
                            "signal": output.get("signal"), "signal_bad": True,
@@ -320,13 +493,7 @@ def compute_score(solution_str, ground_truth, **kwargs):
 
     perception_bad = _perception_bad(solution, output.get("perception"))
     if perception_bad:
-        result = {
-            "score": -1.0,
-            "format_reward": 0.0,
-            "traffic_reward": 0.0,
-            "perception_reward": 0.0,
-            "reasoning_penalty": reasoning_penalty,
-        }
+        result = _invalid_result(reasoning_penalty, gt.get("perception_target"))
         _write_reward_log({"split": split, "sample_id": sample_id, "solution": solution,
                            "ground_truth": gt, "parsed": parsed, "mode": output.get("mode"),
                            "signal": output.get("signal"), "signal_bad": False,
@@ -334,10 +501,31 @@ def compute_score(solution_str, ground_truth, **kwargs):
         return result
 
     format_reward = 1.0 if parsed else 0.0
-    predicted_values = _perception_values(output.get("perception"))
-    target_values = _perception_values(gt.get("perception_target"))
-    correct = sum(abs(pred - target) <= 1 for pred, target in zip(predicted_values, target_values))
-    perception_reward = correct / 44.0 if len(predicted_values) == 44 and len(target_values) == 44 else 0.0
+    perception_components = _perception_components(
+        output.get("perception"), gt.get("perception_target")
+    )
+    if perception_components is None:
+        perception_components = {
+            "perception_reward": 0.0,
+            "traffic_state_score": 0.0,
+            "perception_nonzero_accuracy": 0.0,
+            "perception_zero_accuracy": 0.0,
+            "perception_nonzero_distance_score": 0.0,
+            "perception_zero_distance_score": 0.0,
+            "perception_nonzero_correct": 0,
+            "perception_nonzero_total": 0,
+            "perception_zero_correct": 0,
+            "perception_zero_total": 0,
+            "boundary_correct": 0,
+            "boundary_total": 0,
+            "boundary_exact_accuracy": 0.0,
+            "history_correct": 0,
+            "history_total": 0,
+            "history_exact_accuracy": 0.0,
+            "perception_correct": 0,
+            "perception_total": 56,
+        }
+    perception_reward = float(perception_components["perception_reward"])
     traffic_reward = _traffic(gt, output["signal"])
     actions = gt.get("actions", {})
     action_rewards = {
@@ -348,7 +536,11 @@ def compute_score(solution_str, ground_truth, **kwargs):
         output.get("mode", ""), gt.get("perception_target")
     )
     fast_decision_penalty = 0.0
-    base_reward = traffic_reward + 0.5 * perception_reward + mode_bonus - reasoning_penalty
+    base_reward = (
+        traffic_reward
+        + mode_bonus
+        - reasoning_penalty
+    )
     format_term = -0.5 if not parsed else 0.0
     score = base_reward + format_term
     result = {
@@ -358,14 +550,14 @@ def compute_score(solution_str, ground_truth, **kwargs):
         "base_reward": base_reward,
         "traffic_reward": traffic_reward,
         "perception_reward": perception_reward,
+        "perception_reward_weight": PERCEPTION_REWARD_WEIGHT,
         "reasoning_penalty": reasoning_penalty,
         "best_traffic_reward": best_traffic_reward,
         "fast_decision_penalty": fast_decision_penalty,
         "q_gap": q_gap,
         "fast_confidence": fast_confidence,
         "mode_bonus": mode_bonus,
-        "perception_correct": correct,
-        "perception_total": 44,
+        **perception_components,
     }
     _write_reward_log({"split": split, "sample_id": sample_id, "solution": solution,
                        "ground_truth": gt, "parsed": parsed, "mode": output.get("mode"),

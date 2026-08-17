@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SMOKE=${SMOKE:-0}
 MODEL_PATH=${MODEL_PATH:-/home/apulis-dev/userdata/VLMTSCS/training/LlamaFactory/saves/qwen35-4b/merged/v35_four_video_context_reasoning_512x960_4tags}
 DATA_DIR=${DATA_DIR:-/home/apulis-dev/userdata/VLMTSCS/grpo_v30_offline_local_video_dataset_reduced_pixels}
 WORK_DIR=${WORK_DIR:-/home/apulis-dev/userdata/VLMTSCS/training/LlamaFactory/runs/v35_4b_offline_grpo_512x960_4tags}
@@ -22,9 +23,11 @@ AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-8}
 ROLLOUT_N=${ROLLOUT_N:-6}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
+V35_PERCEPTION_SFT_COEF=${V35_PERCEPTION_SFT_COEF:-0.1}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-2}
 TEST_FREQ=${TEST_FREQ:-10}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
+TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:--1}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-61440}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-4096}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-65536}
@@ -38,12 +41,24 @@ MM_MAX_PIXELS=${MM_MAX_PIXELS:-491520}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REWARD_FILE=${REWARD_FILE:-${SCRIPT_DIR}/v35_offline_grpo_reward.py}
 
+if [[ "${SMOKE}" == "1" ]]; then
+    # Four prompts produce 24 GRPO rollouts plus four gold perception rows.
+    # This is exactly one actor mini-batch and is divisible across four GPUs.
+    TRAIN_MAX_SAMPLES=4
+    TRAIN_BATCH_SIZE=4
+    PPO_MINI_BATCH_SIZE=4
+    TOTAL_EPOCHS=1
+    VAL_BEFORE_TRAIN=False
+    TEST_FREQ=0
+fi
+
 TRAIN_FILE=${TRAIN_FILE:-${DATA_DIR}/train_2000.jsonl}
 VAL_FILE=${VAL_FILE:-${DATA_DIR}/val_100.jsonl}
 OUTPUT_DIR="${WORK_DIR}/checkpoints"
 LOG_DIR="${WORK_DIR}/logs"
 export CUDA_VISIBLE_DEVICES MODEL_PATH V35_GRPO_MODEL_PATH=${MODEL_PATH}
 export V35_GRPO_REWARD_LOG=${REWARD_LOG}
+export V35_PERCEPTION_SFT_COEF
 if [[ -n "${VLLM_ATTENTION_BACKEND}" ]]; then
     export VLLM_ATTENTION_BACKEND
 else
@@ -72,6 +87,7 @@ python -c 'from torch.utils.tensorboard import SummaryWriter' >/dev/null 2>&1 ||
 
 echo "model=${MODEL_PATH}"
 echo "data=${DATA_DIR} train=$(wc -l < "${TRAIN_FILE}") val=$(wc -l < "${VAL_FILE}")"
+echo "smoke=${SMOKE} train_max_samples=${TRAIN_MAX_SAMPLES}"
 echo "multimodal_max_pixels=${MM_MAX_PIXELS} (512x960)"
 echo "epochs=${TOTAL_EPOCHS} val_before_train=${VAL_BEFORE_TRAIN} validation_every_steps=${TEST_FREQ}"
 echo "gpus=${CUDA_VISIBLE_DEVICES} rollout_tp=${ROLLOUT_TP} rollout_n=${ROLLOUT_N} max_response=${MAX_RESPONSE_LENGTH}"
@@ -81,6 +97,7 @@ echo "actor_token_budget_per_gpu=${ACTOR_MAX_TOKEN_LEN_PER_GPU} rollout_logprob_
 echo "val_batch=16 agent_loop_workers=${AGENT_LOOP_WORKERS} rollout_bypass_ppo_clip=true"
 echo "tensorboard=${TENSORBOARD_DIR}"
 echo "reward_log=${V35_GRPO_REWARD_LOG}"
+echo "perception_sft_coef=${V35_PERCEPTION_SFT_COEF} perception_in_grpo_reward=0"
 
 python -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -98,6 +115,7 @@ python -m verl.trainer.main_ppo \
     +data.video_min_pixels=65536 \
     +data.video_max_pixels="${MM_MAX_PIXELS}" \
     data.train_batch_size="${TRAIN_BATCH_SIZE}" \
+    data.train_max_samples="${TRAIN_MAX_SAMPLES}" \
     data.val_batch_size=16 \
     data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
     data.max_response_length="${MAX_RESPONSE_LENGTH}" \
@@ -114,6 +132,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
+    actor_rollout_ref.actor.shuffle=False \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${ACTOR_MAX_TOKEN_LEN_PER_GPU}" \

@@ -7,6 +7,7 @@ import base64
 import json
 import re
 import urllib.request
+from copy import deepcopy
 from functools import partial
 from pathlib import Path
 
@@ -15,8 +16,16 @@ import ray
 from .city_env_config import build_city_env_configs
 from .city_scheduler import load_sampling_config
 from .ray_actors import BranchRequest, create_actor_classes
+from .message_router import (
+    MessageProtocolError,
+    parse_sender_message,
+    render_receiver_message_context,
+    route_messages,
+    select_sender,
+)
+from .prompt_builder import build_receiver_prompt, build_sender_prompt
 from .sumo_adapter import MultiCityBranchAdapter, SUMOEnvFactory, V30RecordingMasterFactory
-from .trajectory import write_group_batch
+from .trajectory import summarize_smoke, write_group_batch
 
 
 SIGNALS = {"ETWT", "NTST", "ELWL", "NLSL"}
@@ -41,25 +50,26 @@ def _load_prompt_template(path: str) -> tuple[str, str]:
     return str(system), str(user)
 
 
+def _base_messages(prompt_template: tuple[str, str], intersection_id: str) -> list[dict[str, str]]:
+    system_text, user_text = prompt_template
+    user_text = re.sub(r"Intersection:\s*[^\n]+", f"Intersection: {intersection_id}", user_text, count=1)
+    user_text += "\n\nOnline smoke observation: no additional coordination frames are available for this cycle."
+    return [{"role": "system", "content": system_text}, {"role": "user", "content": user_text}]
+
+
 def _query(api_url: str, api_key: str, model: str, videos: dict[str, str], timeout: float,
-           temperature: float, prompt_template: tuple[str, str] | None, focal_id: str) -> str:
-    if prompt_template:
-        system_text, user_text = prompt_template
-        user_text = re.sub(r"Intersection:\s*[^\n]+", f"Intersection: {focal_id}", user_text, count=1)
-        user_text += "\n\nOnline smoke observation: no additional coordination frames are available for this cycle."
-    else:
-        system_text = "You are a visual traffic signal controller."
-        user_text = (
-            "Analyze this focal intersection using the four directional videos. "
-            "Return only the required XML tags and choose one signal from ETWT, NTST, ELWL, NLSL."
-        )
+           temperature: float, messages: list[dict[str, object]]) -> str:
+    messages = deepcopy(messages)
+    users = [message for message in messages if message.get("role") == "user"]
+    if len(users) != 1 or not isinstance(users[0].get("content"), str):
+        raise ValueError("Cooperative VLM query requires exactly one string user message")
+    user_text = str(users[0]["content"])
     content = [{"type": "text", "text": user_text}]
     for direction in ("E", "W", "N", "S"):
         content.append({"type": "text", "text": f"Direction {direction}:"})
         content.append({"type": "video_url", "video_url": {"url": _data_url(videos[direction])}})
-    payload = {"model": model, "messages": [
-                   {"role": "system", "content": system_text},
-                   {"role": "user", "content": content}],
+    users[0]["content"] = content
+    payload = {"model": model, "messages": messages,
                "max_tokens": 2048, "temperature": temperature,
                "enable_thinking": False}
     headers = {"Content-Type": "application/json"}
@@ -78,6 +88,11 @@ def _signal(text: str) -> str | None:
     return match.group(1).upper() if match else None
 
 
+def _route_table(city: str) -> dict:
+    path = Path(__file__).with_name("artifacts") / f"movement_routes_{city}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=str(Path(__file__).with_name("city_sampling.yaml")))
@@ -93,6 +108,7 @@ def main() -> None:
     )
     parser.add_argument("--model", default="")
     parser.add_argument("--cities", default="jinan")
+    parser.add_argument("--focal-id", default="")
     parser.add_argument("--rollout-n", type=int, default=6)
     parser.add_argument("--horizon-s", type=int, default=30)
     parser.add_argument("--timeout", type=float, default=900)
@@ -132,28 +148,88 @@ def main() -> None:
         for snapshot in snapshots:
             if not snapshot.observations:
                 raise RuntimeError("Snapshot has no V30 observations")
-            focal_id, observation = sorted(snapshot.observations.items())[0]
+            route_table = _route_table(snapshot.city)
+            focal_id = select_sender(set(snapshot.observations), route_table, args.focal_id)
+            observation = snapshot.observations[focal_id]
             for branch_id in range(args.rollout_n):
+                sender_prompt = build_sender_prompt(_base_messages(prompt_template, focal_id))
                 raw = _query(args.api_url, args.api_key, args.model, observation.videos,
-                             args.timeout, args.temperature, prompt_template, focal_id)
+                             args.timeout, args.temperature, sender_prompt)
                 signal = _signal(raw)
+                sender_signal_valid = signal is not None
+                sender_message_valid = False
                 fallback = signal is None
+                routed = []
                 if fallback:
                     if not args.smoke_fallback:
                         raise RuntimeError(
                             f"Invalid VLM signal for branch {branch_id}: {raw[:500]!r}"
                         )
                     signal = ("ETWT", "NTST", "ELWL", "NLSL")[branch_id % 4]
-                actions = {inter_id: "ETWT" for inter_id in configs[snapshot.city]["INTER_PHASE_MAPPING"]}
+                else:
+                    try:
+                        parsed_messages = parse_sender_message(raw, selected_signal=signal)
+                        routed = route_messages(focal_id, parsed_messages, route_table)
+                        sender_message_valid = True
+                    except (MessageProtocolError, KeyError, ValueError) as error:
+                        if not args.smoke_fallback:
+                            raise RuntimeError(
+                                f"Invalid sender message for branch {branch_id}: {error}"
+                            ) from error
+                        fallback = True
+
+                if not snapshot.background_actions:
+                    raise RuntimeError(f"Snapshot {snapshot.snapshot_id} has no V25 background actions")
+                actions = dict(snapshot.background_actions)
                 actions[focal_id] = signal
+                receiver_contexts = render_receiver_message_context(routed)
+                receiver_records = []
+                for receiver_id, message_context in sorted(receiver_contexts.items()):
+                    receiver_observation = snapshot.observations.get(receiver_id)
+                    if receiver_observation is None:
+                        raise RuntimeError(f"Snapshot has no observation for receiver {receiver_id}")
+                    receiver_prompt = build_receiver_prompt(
+                        _base_messages(prompt_template, receiver_id), message_context
+                    )
+                    receiver_raw = _query(
+                        args.api_url, args.api_key, args.model, receiver_observation.videos,
+                        args.timeout, args.temperature, receiver_prompt,
+                    )
+                    receiver_signal = _signal(receiver_raw)
+                    receiver_fallback = receiver_signal is None
+                    if receiver_fallback:
+                        if not args.smoke_fallback:
+                            raise RuntimeError(
+                                f"Invalid receiver {receiver_id} signal for branch {branch_id}: "
+                                f"{receiver_raw[:500]!r}"
+                            )
+                        receiver_signal = "ETWT"
+                        fallback = True
+                    actions[receiver_id] = receiver_signal
+                    receiver_records.append({
+                        "intersection_id": receiver_id,
+                        "signal": receiver_signal,
+                        "fallback": receiver_fallback,
+                        "response": receiver_raw,
+                        "prompt": receiver_prompt,
+                        "videos": dict(receiver_observation.videos),
+                        "message_context": message_context,
+                    })
+                receiver_ids = tuple(sorted(receiver_contexts))
                 print(json.dumps({"snapshot_id": snapshot.snapshot_id, "focal_id": focal_id,
                                   "branch_id": branch_id, "signal": signal,
+                                  "receiver_ids": receiver_ids,
                                   "fallback": fallback, "response": raw},
                                  ensure_ascii=False))
                 actor = Branch.remote(partial(MultiCityBranchAdapter, branch_factory, f"vlm_{len(branches)}"), len(branches))
                 branches.append(actor)
                 all_results.append(actor.rollout.remote(
-                    BranchRequest(snapshot, actions, reward_region={"focal_id": focal_id}, horizon_s=args.horizon_s),
+                    BranchRequest(
+                        snapshot,
+                        actions,
+                        reward_region={"focal_id": focal_id, "receiver_ids": receiver_ids},
+                        horizon_s=args.horizon_s,
+                    ),
                     branch_id))
                 trajectory_records.append({
                     "snapshot_id": snapshot.snapshot_id,
@@ -161,8 +237,14 @@ def main() -> None:
                     "focal_id": focal_id,
                     "branch_id": branch_id,
                     "signal": signal,
+                    "sender_signal_valid": sender_signal_valid,
+                    "sender_message_valid": sender_message_valid,
                     "fallback": fallback,
                     "response": raw,
+                    "prompt": sender_prompt,
+                    "receivers": receiver_records,
+                    "receiver_ids": receiver_ids,
+                    "routed_messages": [item.__dict__ for item in routed],
                     "videos": dict(observation.videos),
                     "prompt_template": args.prompt_template,
                     "model": args.model,
@@ -172,13 +254,15 @@ def main() -> None:
         for record, result in zip(trajectory_records, results):
             record["reward"] = float(result["reward"])
             record["environment_result"] = result.get("environment_result", {})
+        summary = summarize_smoke(trajectory_records)
         if args.trajectory_output:
             write_group_batch(args.trajectory_output, trajectory_records)
             print(json.dumps({"trajectory_output": args.trajectory_output,
                               "trajectory_records": len(trajectory_records)}, ensure_ascii=False))
         print(json.dumps({"groups": {s.snapshot_id: sum(r["snapshot_id"] == s.snapshot_id for r in results)
                                       for s in snapshots},
-                          "rewards": [r["reward"] for r in results]}, ensure_ascii=False))
+                          "rewards": [r["reward"] for r in results],
+                          "smoke_summary": summary}, ensure_ascii=False))
     finally:
         if branches:
             try:

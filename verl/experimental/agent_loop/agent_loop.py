@@ -189,6 +189,18 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g. pixel_values, image_grid_thw, video_grid_thw)."""
+    grpo_loss_mask: Optional[torch.Tensor] = None
+    """Padded response mask restricting policy gradients to the decision suffix."""
+    perception_sft_responses: Optional[torch.Tensor] = None
+    """Padded gold perception continuation token ids."""
+    perception_sft_input_ids: Optional[torch.Tensor] = None
+    """Padded prompt plus gold perception token ids."""
+    perception_sft_attention_mask: Optional[torch.Tensor] = None
+    """Attention mask for the gold perception continuation."""
+    perception_sft_position_ids: Optional[torch.Tensor] = None
+    """Multi-modal position ids for the gold perception continuation."""
+    perception_sft_mask: Optional[torch.Tensor] = None
+    """Padded token mask used by the perception cross-entropy loss."""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
 
@@ -836,6 +848,61 @@ class AgentLoopWorker:
                 output.multi_modal_data.get("audios") if output.multi_modal_data else None
             ),
         )
+        grpo_loss_mask = None
+        perception_sft_responses = None
+        perception_sft_input_ids = None
+        perception_sft_attention_mask = None
+        perception_sft_position_ids = None
+        perception_sft_mask = None
+        perception_sft_coef = float(os.environ.get("V35_PERCEPTION_SFT_COEF", "0"))
+        if perception_sft_coef > 0.0 and not validate:
+            from v35_offline_grpo.perception_sft import build_grpo_loss_mask, build_perception_target
+
+            target_text = build_perception_target(kwargs.get("reward_model"), kwargs.get("raw_prompt"))
+            target_ids = self.tokenizer.encode(target_text, add_special_tokens=False)
+            if len(target_ids) > self.rollout_config.response_length:
+                sample_id = kwargs.get("index", "unknown")
+                raise ValueError(
+                    f"perception SFT target for {sample_id} has {len(target_ids)} tokens, "
+                    f"exceeding response_length={self.rollout_config.response_length}"
+                )
+
+            grpo_mask_ids = build_grpo_loss_mask(output.response_ids, self.tokenizer)
+            grpo_loss_mask = self._pad_token_ids(
+                grpo_mask_ids,
+                max_length=self.rollout_config.response_length,
+                padding_side="right",
+                return_attention_mask=False,
+            )["input_ids"] * response_mask
+
+            target_output = self._pad_token_ids(
+                target_ids,
+                max_length=self.rollout_config.response_length,
+                padding_side="right",
+                return_attention_mask=True,
+            )
+            perception_sft_responses = target_output["input_ids"]
+            perception_sft_mask = target_output["attention_mask"]
+            perception_sft_attention_mask = torch.cat(
+                [prompt_output["attention_mask"], perception_sft_mask], dim=1
+            )
+            perception_sft_input_ids = torch.cat(
+                [prompt_output["input_ids"], perception_sft_responses], dim=1
+            )
+            perception_sft_position_ids = self._compute_position_ids(
+                perception_sft_input_ids,
+                perception_sft_attention_mask,
+                dict(multi_modal_inputs),
+                output.mm_processor_kwargs
+                if output.mm_processor_kwargs is not None
+                else self._get_mm_processor_kwargs(
+                    output.multi_modal_data.get("audios") if output.multi_modal_data else None
+                ),
+            )
+        # Newer Qwen processors expose this field for M-RoPE construction, but
+        # the model forward does not consume it. Drop it only after both the
+        # rollout and optional gold continuation have built their positions.
+        multi_modal_inputs.pop("mm_token_type_ids", None)
         await self._compute_score([output], kwargs=kwargs)
         await self._compute_teacher_logprobs(
             output,
@@ -872,6 +939,12 @@ class AgentLoopWorker:
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
             multi_modal_inputs=multi_modal_inputs,
+            grpo_loss_mask=grpo_loss_mask,
+            perception_sft_responses=perception_sft_responses,
+            perception_sft_input_ids=perception_sft_input_ids,
+            perception_sft_attention_mask=perception_sft_attention_mask,
+            perception_sft_position_ids=perception_sft_position_ids,
+            perception_sft_mask=perception_sft_mask,
             multi_modal_data=output.multi_modal_data,
             mm_processor_kwargs=output.mm_processor_kwargs,
             teacher_logprobs=teacher_logprobs,
@@ -946,6 +1019,10 @@ class AgentLoopWorker:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
     ) -> torch.Tensor:
         """Compute position ids for multi-modal inputs."""
+        # Position construction removes processor-only fields below. Keep the
+        # caller's inputs intact because rollout and gold continuations reuse
+        # the same multimodal metadata.
+        multi_modal_inputs = dict(multi_modal_inputs)
         # text-only OR non-M-RoPE multimodal (e.g. Gemma4) -> standard 1D positions
         if self.processor is None or not hasattr(self.processor, "get_rope_index"):
             return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
@@ -1127,6 +1204,19 @@ class AgentLoopWorker:
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+        if inputs[0].grpo_loss_mask is not None:
+            segmented_fields = (
+                "grpo_loss_mask",
+                "perception_sft_responses",
+                "perception_sft_input_ids",
+                "perception_sft_attention_mask",
+                "perception_sft_position_ids",
+                "perception_sft_mask",
+            )
+            if any(getattr(item, key) is None for item in inputs for key in segmented_fields):
+                raise ValueError("incomplete perception SFT tensors in agent-loop output")
+            for key in segmented_fields:
+                optional_outputs[key] = torch.cat([getattr(item, key) for item in inputs], dim=0)
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]

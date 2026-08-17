@@ -8,6 +8,7 @@ from v35_online_cooperative_grpo.message_router import (
     parse_sender_message,
     render_receiver_message_context,
     route_messages,
+    select_sender,
 )
 
 
@@ -59,3 +60,23 @@ def test_receiver_context_contains_system_owned_direction_metadata():
     assert "Source movement: WT" in context
     assert "enters your W approach" in context
     assert "westbound traffic approaching" in context
+
+
+def test_sender_selection_prefers_largest_observed_receiver_neighborhood():
+    routes = {
+        "routes": {
+            "a": {"movements": {"ET": {"is_boundary": False, "receiver_id": "b"}}},
+            "b": {"movements": {
+                "ET": {"is_boundary": False, "receiver_id": "a"},
+                "WT": {"is_boundary": False, "receiver_id": "c"},
+            }},
+            "c": {"movements": {"ET": {"is_boundary": True, "receiver_id": None}}},
+        }
+    }
+    assert select_sender({"a", "b", "c"}, routes) == "b"
+    assert select_sender({"a", "b", "c"}, routes, "a") == "a"
+
+
+def test_explicit_sender_requires_current_observation():
+    with pytest.raises(ValueError, match="no observation"):
+        select_sender({"a"}, {"routes": {"a": {"movements": {}}}}, "missing")

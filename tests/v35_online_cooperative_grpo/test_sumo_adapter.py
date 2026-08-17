@@ -25,3 +25,23 @@ def test_adapter_maps_phase_labels_and_runs_full_action_table(tmp_path):
     outcome=adapter.execute({'i':'NTST'},30)
     assert outcome['info']['actions']=={'i':1}
     assert outcome['endpoint']['i']['remaining_v_150m']==3.0
+
+
+def test_cooperative_reward_averages_sender_and_receiver_costs():
+    adapter = SUMOEnvAdapter(Env(), 1)
+    result = {
+        "endpoint": {
+            "sender": {"queue_150m": 4.0, "remaining_v_150m": 10.0},
+            "receiver": {"queue_150m": 2.0, "remaining_v_150m": 20.0},
+        }
+    }
+    reward = adapter.compute_reward(
+        {"focal_id": "sender", "receiver_ids": ("receiver",)}, result
+    )
+    assert reward == -4.5
+
+
+def test_cooperative_reward_remains_backward_compatible_with_focal_only():
+    adapter = SUMOEnvAdapter(Env(), 1)
+    result = {"endpoint": {"sender": {"queue_150m": 4.0, "remaining_v_150m": 10.0}}}
+    assert adapter.compute_reward({"focal_id": "sender"}, result) == -5.0

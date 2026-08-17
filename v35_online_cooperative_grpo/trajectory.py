@@ -8,6 +8,30 @@ from pathlib import Path
 from typing import Any
 
 
+def summarize_smoke(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return protocol and reward diagnostics for one cooperative smoke batch."""
+    branches = len(records)
+    receiver_rows = [receiver for row in records for receiver in row.get("receivers", [])]
+    rewards = [float(row["reward"]) for row in records if "reward" in row]
+    reward_mean = sum(rewards) / len(rewards) if rewards else 0.0
+    reward_std = (
+        math.sqrt(sum((reward - reward_mean) ** 2 for reward in rewards) / len(rewards))
+        if rewards else 0.0
+    )
+    return {
+        "branches": branches,
+        "sender_signal_valid": sum(bool(row.get("sender_signal_valid")) for row in records),
+        "sender_message_valid": sum(bool(row.get("sender_message_valid")) for row in records),
+        "branches_with_receivers": sum(bool(row.get("receiver_ids")) for row in records),
+        "receiver_generations": len(receiver_rows),
+        "receiver_signal_valid": sum(not bool(row.get("fallback")) for row in receiver_rows),
+        "fallback_branches": sum(bool(row.get("fallback")) for row in records),
+        "reward_mean": reward_mean,
+        "reward_std": reward_std,
+        "zero_reward_variance": bool(rewards) and reward_std <= 1e-6,
+    }
+
+
 def write_group_batch(path: str | Path, records: list[dict[str, Any]]) -> None:
     """Write one JSONL record per branch with within-snapshot advantages."""
     groups: dict[str, list[dict[str, Any]]] = {}

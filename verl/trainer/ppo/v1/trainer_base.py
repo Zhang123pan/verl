@@ -102,6 +102,135 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+_PERCEPTION_SFT_SOURCE_KEYS = (
+    "perception_sft_responses",
+    "perception_sft_input_ids",
+    "perception_sft_attention_mask",
+    "perception_sft_position_ids",
+)
+_PERCEPTION_SFT_REQUIRED_KEYS = (
+    *_PERCEPTION_SFT_SOURCE_KEYS,
+    "grpo_loss_mask",
+    "perception_sft_mask",
+)
+
+
+def _tensordict_row(data: TensorDict, index: int) -> dict[str, Any]:
+    row = {}
+    for key, value in data.items():
+        if isinstance(value, torch.Tensor):
+            row[key] = value[index]
+        elif isinstance(value, NonTensorData):
+            row[key] = value.data
+        else:
+            row[key] = value[index].data
+    return row
+
+
+def _select_tensordict_rows(data: TensorDict, indices: list[int]) -> TensorDict:
+    """Select rows without advanced-indexing nested/jagged tensors."""
+    return tu.list_of_dict_to_tensordict([_tensordict_row(data, index) for index in indices])
+
+
+def _build_perception_sft_actor_batch(batch: KVBatchMeta, rollout_n: int) -> tuple[KVBatchMeta, list[str]]:
+    """Append one actor-only gold perception row per rollout group in TransferQueue."""
+    data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id)
+    missing = [key for key in _PERCEPTION_SFT_REQUIRED_KEYS if key not in data]
+    if missing:
+        raise ValueError(f"perception SFT is enabled but rollout output is missing {missing}")
+    if "routed_experts" in data:
+        raise ValueError("perception SFT is not compatible with rollout routing replay")
+    if "teacher_logprobs" in data or "teacher_ids" in data:
+        raise ValueError("perception SFT is not compatible with top-k distillation")
+
+    from v35_offline_grpo.perception_sft import build_perception_sft_row_indices
+
+    prompt_uids = []
+    padding_counts: dict[str, int] = defaultdict(int)
+    for key, tag in zip(batch.keys, batch.tags, strict=True):
+        uid = key.split("_", 1)[0]
+        if tag.get("is_padding", False):
+            # V1 may create several complete padding groups under one UID.
+            # Give each rollout_n-sized chunk its own temporary group label.
+            padding_index = padding_counts[uid]
+            padding_counts[uid] += 1
+            uid = f"{uid}:padding-group-{padding_index // rollout_n}"
+        prompt_uids.append(uid)
+    prompt_uids = np.asarray(prompt_uids, dtype=object)
+    gold_indices_list, interleaved_indices_list = build_perception_sft_row_indices(prompt_uids, rollout_n)
+    rollout_data = data.clone()
+    gold_data = _select_tensordict_rows(data, gold_indices_list)
+    gold_data["responses"] = gold_data["perception_sft_responses"]
+    gold_data["input_ids"] = gold_data["perception_sft_input_ids"]
+    gold_data["attention_mask"] = gold_data["perception_sft_attention_mask"]
+    gold_data["position_ids"] = gold_data["perception_sft_position_ids"]
+    gold_data["response_mask"] = gold_data["perception_sft_mask"]
+    gold_data["loss_mask"] = gold_data["response_mask"].clone()
+
+    rollout_data["kl_loss_mask"] = rollout_data["response_mask"].clone()
+    rollout_data["perception_sft_mask"] = torch.zeros_like(rollout_data["response_mask"])
+    gold_data["grpo_loss_mask"] = torch.zeros_like(gold_data["response_mask"])
+    gold_data["kl_loss_mask"] = torch.zeros_like(gold_data["response_mask"])
+
+    for key in (
+        "old_log_probs",
+        "advantages",
+        "ref_log_prob",
+        "rollout_log_probs",
+        "rollout_is_weights",
+        "token_level_scores",
+        "token_level_rewards",
+        "returns",
+        "values",
+        "rm_scores",
+    ):
+        if key in gold_data:
+            gold_data[key] = torch.zeros_like(gold_data["response_mask"], dtype=gold_data[key].dtype)
+
+    for key in _PERCEPTION_SFT_SOURCE_KEYS:
+        rollout_data.pop(key)
+        gold_data.pop(key)
+
+    rollout_count = len(rollout_data)
+    combined_data = tu.list_of_dict_to_tensordict(
+        [
+            _tensordict_row(rollout_data, index)
+            if index < rollout_count
+            else _tensordict_row(gold_data, index - rollout_count)
+            for index in interleaved_indices_list
+        ]
+    )
+    gold_keys = [f"{batch.keys[index]}_perception_sft_{uuid.uuid4().hex}" for index in gold_indices_list]
+    combined_keys = np.asarray([*batch.keys, *gold_keys], dtype=object)[interleaved_indices_list].tolist()
+
+    gold_tags = []
+    gold_attention_mask = gold_data["attention_mask"]
+    gold_lengths = (
+        gold_attention_mask.offsets().diff().tolist()
+        if gold_attention_mask.is_nested
+        else gold_attention_mask.sum(dim=-1).tolist()
+    )
+    for index, seq_len in zip(gold_indices_list, gold_lengths, strict=True):
+        tag = dict(batch.tags[index])
+        tag.update(seq_len=int(seq_len), is_perception_sft=True)
+        gold_tags.append(tag)
+    combined_tags = np.asarray([*batch.tags, *gold_tags], dtype=object)[interleaved_indices_list].tolist()
+
+    actor_batch = tq.kv_batch_put(
+        keys=combined_keys,
+        partition_id=batch.partition_id,
+        fields=combined_data,
+        tags=combined_tags,
+    )
+    logger.info(
+        "Prepared perception-SFT actor batch: rollout_rows=%d gold_rows=%d actor_rows=%d",
+        len(batch),
+        len(gold_keys),
+        len(combined_keys),
+    )
+    return actor_batch, gold_keys
+
+
 def _tq_supports_checkpoint() -> bool:
     """Whether the installed TransferQueue can snapshot/restore its state for checkpoint consistency."""
     try:
@@ -581,7 +710,17 @@ class PPOTrainer(ABC):
         # 9. update actor
         if self.config.trainer.critic_warmup <= self.global_steps:
             with marked_timer("update_actor", timing_raw, color="red"):
-                batch = self._update_actor(batch, metrics=metrics)
+                perception_sft_coef = float(os.environ.get("V35_PERCEPTION_SFT_COEF", "0"))
+                if perception_sft_coef > 0.0:
+                    actor_batch, gold_keys = _build_perception_sft_actor_batch(
+                        batch, rollout_n=self.config.actor_rollout_ref.rollout.n
+                    )
+                    try:
+                        self._update_actor(actor_batch, metrics=metrics)
+                    finally:
+                        tq.kv_clear(keys=gold_keys, partition_id=batch.partition_id)
+                else:
+                    batch = self._update_actor(batch, metrics=metrics)
 
         return batch
 
@@ -1672,7 +1811,9 @@ class PPOTrainer(ABC):
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        perception_sft_coef = float(os.environ.get("V35_PERCEPTION_SFT_COEF", "0"))
+        samples_per_prompt = self.config.actor_rollout_ref.rollout.n + (1 if perception_sft_coef > 0.0 else 0)
+        ppo_mini_batch_size = ppo_mini_batch_size * samples_per_prompt
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )

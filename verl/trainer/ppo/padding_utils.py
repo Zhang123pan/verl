@@ -112,6 +112,26 @@ def construct_minimal_padding_template(
         rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
         rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
     )
+    perception_sft_keys = {
+        "grpo_loss_mask",
+        "perception_sft_responses",
+        "perception_sft_input_ids",
+        "perception_sft_attention_mask",
+        "perception_sft_position_ids",
+        "perception_sft_mask",
+    }
+    if perception_sft_keys.issubset(template_sample):
+        # A synthetic padding prompt must not retain the source sample's visual
+        # gold continuation. Keep the extra actor row structurally valid while
+        # making both its GRPO and perception losses inert.
+        template_sample.update(
+            grpo_loss_mask=torch.zeros_like(response_mask),
+            perception_sft_responses=prompts.clone(),
+            perception_sft_input_ids=input_ids.clone(),
+            perception_sft_attention_mask=attention_mask.clone(),
+            perception_sft_position_ids=position_ids.clone(),
+            perception_sft_mask=torch.zeros_like(response_mask),
+        )
     if "multi_modal_inputs" in template_sample:
         template_sample["multi_modal_inputs"] = {}
     if routed_experts is not None:

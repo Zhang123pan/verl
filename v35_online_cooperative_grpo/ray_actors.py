@@ -20,6 +20,7 @@ class SnapshotRef:
     sim_time_s: float
     seed: int | None = None
     observations: dict[str, Any] | None = None
+    background_actions: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class TimelineAdapter(Protocol):
     def save_snapshot(self, path: str) -> float: ...
     def close(self) -> None: ...
     def observations(self) -> dict[str, Any]: ...
+    def planned_background_actions(self) -> dict[str, str]: ...
 
 
 class BranchAdapter(Protocol):
@@ -82,7 +84,11 @@ def create_actor_classes():
             if not os.path.isfile(path) or os.path.getsize(path) <= 0:
                 raise RuntimeError(f"SUMO snapshot was not created: {path}")
             observations = self.adapter.observations() if hasattr(self.adapter, "observations") else None
-            return SnapshotRef(self.city, self.episode_id, snapshot_id, path, sim_time, observations=observations)
+            background_actions = self.adapter.planned_background_actions()
+            return SnapshotRef(
+                self.city, self.episode_id, snapshot_id, path, sim_time,
+                observations=observations, background_actions=background_actions,
+            )
 
         def advance_and_publish(self, seconds: int = 30) -> SnapshotRef:
             if seconds <= 0:
@@ -123,7 +129,11 @@ def create_actor_classes():
             if not os.path.isfile(path) or os.path.getsize(path) <= 0:
                 raise RuntimeError(f"SUMO snapshot was not created: {path}")
             observations = self.adapter.observations() if hasattr(self.adapter, "observations") else None
-            return SnapshotRef(self.city, self.episode_id, snapshot_id, path, sim_time, self.seed, observations)
+            background_actions = self.adapter.planned_background_actions()
+            return SnapshotRef(
+                self.city, self.episode_id, snapshot_id, path, sim_time,
+                self.seed, observations, background_actions,
+            )
 
         def advance_and_publish(self, seconds: int = 30) -> SnapshotRef:
             if seconds <= 0 or seconds > self.episode_seconds:

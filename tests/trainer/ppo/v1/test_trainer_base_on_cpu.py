@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
 from omegaconf import OmegaConf
+from tensordict import TensorDict
+from tensordict.tensorclass import NonTensorStack
 
+from verl.trainer.ppo.padding_utils import construct_minimal_padding_template
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
-from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+from verl.trainer.ppo.v1.trainer_base import PPOTrainer, _build_perception_sft_actor_batch
 
 
 class _StubTrainer(PPOTrainer):
@@ -163,3 +168,117 @@ def test_builtin_filter_groups_warns_when_total_generation_limit_is_configured()
         "use max_inflight_gen_batches to bound concurrent Sync DAPO generation.",
         10,
     )
+
+
+def _nested(rows: list[list[int] | list[float]], dtype: torch.dtype) -> torch.Tensor:
+    return torch.nested.as_nested_tensor([torch.tensor(row, dtype=dtype) for row in rows], layout=torch.jagged)
+
+
+def test_build_perception_sft_actor_batch_interleaves_gold_rows_and_aligns_masks():
+    prompt_uids = ["uid-a", "uid-b", "uid-c", "uid-d"]
+    keys = [f"{uid}_{session_id}_0" for session_id in range(6) for uid in prompt_uids]
+    row_count = len(keys)
+
+    rollout_responses = [[10 + index, 20 + index] for index in range(row_count)]
+    gold_responses = [[100 + index, 200 + index, 300 + index] for index in range(row_count)]
+    rollout_inputs = [[1, 2, *response] for response in rollout_responses]
+    gold_inputs = [[1, 2, *response] for response in gold_responses]
+    data = TensorDict(
+        {
+            "responses": _nested(rollout_responses, torch.int64),
+            "input_ids": _nested(rollout_inputs, torch.int64),
+            "attention_mask": _nested([[1] * 4 for _ in keys], torch.int64),
+            "position_ids": _nested([list(range(4)) for _ in keys], torch.int64),
+            "response_mask": _nested([[1, 1] for _ in keys], torch.int64),
+            "loss_mask": _nested([[1, 1] for _ in keys], torch.int64),
+            "grpo_loss_mask": _nested([[0, 1] for _ in keys], torch.int64),
+            "perception_sft_responses": _nested(gold_responses, torch.int64),
+            "perception_sft_input_ids": _nested(gold_inputs, torch.int64),
+            "perception_sft_attention_mask": _nested([[1] * 5 for _ in keys], torch.int64),
+            "perception_sft_position_ids": _nested([list(range(5)) for _ in keys], torch.int64),
+            "perception_sft_mask": _nested([[1, 1, 1] for _ in keys], torch.int64),
+            "old_log_probs": _nested([[0.2, 0.3] for _ in keys], torch.float32),
+            "advantages": _nested([[0.5, 0.5] for _ in keys], torch.float32),
+            "ref_log_prob": _nested([[0.1, 0.1] for _ in keys], torch.float32),
+            "metadata": NonTensorStack(*[{"row": index} for index in range(row_count)]),
+        },
+        batch_size=[row_count],
+    )
+    tags = [{"seq_len": 4, "status": "success"} for _ in keys]
+    batch = SimpleNamespace(keys=list(keys), partition_id="train", tags=tags)
+    actor_batch = object()
+
+    with (
+        patch("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_get", return_value=data),
+        patch("verl.trainer.ppo.v1.trainer_base.tq.kv_batch_put", return_value=actor_batch) as kv_batch_put,
+    ):
+        result, gold_keys = _build_perception_sft_actor_batch(batch, rollout_n=6)
+
+    assert result is actor_batch
+    assert len(gold_keys) == 4
+    assert batch.keys == keys
+    assert "perception_sft_responses" in data
+
+    put_kwargs = kv_batch_put.call_args.kwargs
+    combined_keys = put_kwargs["keys"]
+    combined_tags = put_kwargs["tags"]
+    combined_data = put_kwargs["fields"]
+    assert len(combined_keys) == 28
+    assert len(combined_data) == 28
+
+    for group_index, uid in enumerate(prompt_uids):
+        start = group_index * 7
+        assert combined_keys[start : start + 6] == [f"{uid}_{session_id}_0" for session_id in range(6)]
+        assert combined_keys[start + 6].startswith(f"{uid}_0_0_perception_sft_")
+        assert combined_tags[start + 6]["seq_len"] == 5
+        assert combined_tags[start + 6]["is_perception_sft"] is True
+
+        for rollout_index in range(start, start + 6):
+            assert combined_data["grpo_loss_mask"][rollout_index].tolist() == [0, 1]
+            assert combined_data["perception_sft_mask"][rollout_index].tolist() == [0, 0]
+            assert combined_data["kl_loss_mask"][rollout_index].tolist() == [1, 1]
+
+        gold_index = start + 6
+        assert combined_data["grpo_loss_mask"][gold_index].tolist() == [0, 0, 0]
+        assert combined_data["perception_sft_mask"][gold_index].tolist() == [1, 1, 1]
+        assert combined_data["kl_loss_mask"][gold_index].tolist() == [0, 0, 0]
+        assert combined_data["loss_mask"][gold_index].tolist() == [1, 1, 1]
+        assert combined_data["old_log_probs"][gold_index].tolist() == [0.0, 0.0, 0.0]
+        assert combined_data["metadata"][gold_index].data == {"row": group_index}
+
+    for source_key in (
+        "perception_sft_responses",
+        "perception_sft_input_ids",
+        "perception_sft_attention_mask",
+        "perception_sft_position_ids",
+    ):
+        assert source_key not in combined_data
+
+
+def test_padding_template_replaces_perception_gold_with_inert_text_row():
+    source = {
+        "prompts": torch.tensor([1, 2]),
+        "responses": torch.tensor([3, 4]),
+        "input_ids": torch.tensor([1, 2, 3, 4]),
+        "attention_mask": torch.ones(4, dtype=torch.int64),
+        "position_ids": torch.arange(4),
+        "response_mask": torch.ones(2, dtype=torch.int64),
+        "grpo_loss_mask": torch.ones(2, dtype=torch.int64),
+        "perception_sft_responses": torch.tensor([5, 6, 7]),
+        "perception_sft_input_ids": torch.tensor([1, 2, 5, 6, 7]),
+        "perception_sft_attention_mask": torch.ones(5, dtype=torch.int64),
+        "perception_sft_position_ids": torch.arange(5),
+        "perception_sft_mask": torch.ones(3, dtype=torch.int64),
+        "multi_modal_inputs": {"video_grid_thw": torch.tensor([[1, 2, 2]])},
+    }
+
+    sample, tag = construct_minimal_padding_template(source, {"seq_len": 4}, eos_token_id=99)
+
+    assert sample["perception_sft_responses"].tolist() == [99]
+    assert sample["perception_sft_input_ids"].tolist() == [99, 99]
+    assert sample["perception_sft_attention_mask"].tolist() == [1, 1]
+    assert sample["perception_sft_position_ids"].tolist() == [0, 1]
+    assert sample["perception_sft_mask"].tolist() == [0]
+    assert sample["grpo_loss_mask"].tolist() == [0]
+    assert sample["multi_modal_inputs"] == {}
+    assert tag["is_padding"] is True

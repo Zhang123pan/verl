@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import os
+
 import torch
 from tensordict import TensorDict
 
@@ -62,10 +64,13 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         entropy = no_padding_2_padding(entropy, data)
 
     # global batch info for loss aggregation
-    config.global_batch_info["dp_size"] = data["dp_size"]
-    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
-    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
-    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+    default_global_batch_info = {
+        "dp_size": data["dp_size"],
+        "batch_num_tokens": data["batch_num_tokens"],
+        "global_batch_size": data["global_batch_size"],
+        "loss_scale_factor": config.loss_scale_factor,
+    }
+    config.global_batch_info.update(default_global_batch_info)
 
     # assumes that if any of the global batch info is set, the policy_loss_fn will
     # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM
@@ -83,7 +88,23 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     metrics = {}
 
     # select fields and convert to padded tensor
+    perception_sft_coef = float(os.environ.get("V35_PERCEPTION_SFT_COEF", "0"))
+    segmented_loss = perception_sft_coef > 0.0
     fields = ["response_mask", "old_log_probs", "advantages"]
+    if segmented_loss:
+        required_masks = ("grpo_loss_mask", "perception_sft_mask", "kl_loss_mask")
+        missing_masks = [key for key in required_masks if key not in data]
+        if missing_masks:
+            raise ValueError(f"perception SFT is enabled but actor batch is missing {missing_masks}")
+        segmented_normalizers = {}
+        for mask_key in required_masks:
+            for suffix in ("num_tokens", "num_sequences"):
+                normalizer_key = f"{mask_key}_{suffix}"
+                value = tu.get_non_tensor_data(data, normalizer_key, None)
+                if value is None:
+                    raise ValueError(f"actor batch is missing segmented normalizer {normalizer_key}")
+                segmented_normalizers[normalizer_key] = value
+        fields.extend(required_masks)
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
@@ -91,6 +112,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
+    grpo_loss_mask = data["grpo_loss_mask"].to(bool) if segmented_loss else response_mask
+    perception_sft_mask = data["perception_sft_mask"].to(bool) if segmented_loss else None
+    kl_loss_mask = data["kl_loss_mask"].to(bool) if segmented_loss else response_mask
     # compute policy loss
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]
@@ -101,15 +125,23 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
+    if segmented_loss:
+        grpo_global_batch_info = {
+            **default_global_batch_info,
+            "batch_num_tokens": segmented_normalizers["grpo_loss_mask_num_tokens"],
+            "global_batch_size": segmented_normalizers["grpo_loss_mask_num_sequences"],
+        }
+        config.global_batch_info.update(grpo_global_batch_info)
     pg_loss, pg_metrics = policy_loss_fn(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
         advantages=advantages,
-        response_mask=response_mask,
+        response_mask=grpo_loss_mask,
         loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
     )
+    config.global_batch_info.update(default_global_batch_info)
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
@@ -121,8 +153,12 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # add entropy loss
     if entropy is not None:
+        entropy_global_batch_info = grpo_global_batch_info if segmented_loss else default_global_batch_info
         entropy_loss = agg_loss(
-            loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+            loss_mat=entropy,
+            loss_mask=grpo_loss_mask,
+            loss_agg_mode=loss_agg_mode,
+            **entropy_global_batch_info,
         )
         entropy_coeff = config.entropy_coeff
         policy_loss -= entropy_coeff * entropy_loss
@@ -133,13 +169,45 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         ref_log_prob = data["ref_log_prob"]
         # compute kl loss
         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
+        kl_global_batch_info = default_global_batch_info
+        if segmented_loss:
+            kl_global_batch_info = {
+                **default_global_batch_info,
+                "batch_num_tokens": segmented_normalizers["kl_loss_mask_num_tokens"],
+                "global_batch_size": segmented_normalizers["kl_loss_mask_num_sequences"],
+            }
         kl_loss = agg_loss(
-            loss_mat=kld, loss_mask=response_mask, loss_agg_mode=config.loss_agg_mode, **config.global_batch_info
+            loss_mat=kld,
+            loss_mask=kl_loss_mask,
+            loss_agg_mode=config.loss_agg_mode,
+            **kl_global_batch_info,
         )
 
         policy_loss += kl_loss * config.kl_loss_coef
         metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
         metrics["kl_coef"] = config.kl_loss_coef
+
+    if segmented_loss:
+        perception_token_count = segmented_normalizers["perception_sft_mask_num_tokens"]
+        if perception_token_count <= 0:
+            raise ValueError("perception SFT mini-batch contains no gold tokens")
+        perception_sft_loss = agg_loss(
+            loss_mat=-log_prob,
+            loss_mask=perception_sft_mask,
+            loss_agg_mode="token-mean",
+            dp_size=default_global_batch_info["dp_size"],
+            batch_num_tokens=perception_token_count,
+        )
+        policy_loss += perception_sft_coef * perception_sft_loss
+        metrics["actor/perception_sft_loss"] = Metric(
+            value=perception_sft_loss,
+            aggregation=metric_aggregation,
+        )
+        metrics["actor/perception_sft_coef"] = perception_sft_coef
+        metrics["actor/perception_sft_tokens"] = Metric(
+            value=perception_sft_mask.sum() * default_global_batch_info["dp_size"],
+            aggregation=AggregationType.SUM,
+        )
 
     return policy_loss, metrics
 

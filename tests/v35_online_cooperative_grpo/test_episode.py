@@ -6,7 +6,7 @@ from v35_online_cooperative_grpo.episode import CooperativeEpisode, GeneratedRes
 
 def _response(signal, message=True):
     msg = '<message><to movement="ET">east</to><to movement="WT">west</to></message>' if message else ''
-    return f'<perception>{{}}</perception><mode>fast</mode><current_v>{{}}</current_v><signal>{signal}</signal>{msg}'
+    return f'<perception>{{}}</perception><mode>fast</mode><signal>{signal}</signal>{msg}'
 
 
 class Env:
@@ -14,7 +14,7 @@ class Env:
     def clone(self, snapshot_id, branch_id): return Env(self.parent)
     def base_messages(self, intersection_id):
         return [{"role":"user","content":"Critical format warning:\n\n" +
-                "Your response must use exactly one of these valid layouts:\n\nFast mode:\n<perception>...</perception>\n<mode>fast</mode>\n<current_v>...</current_v>\n<signal>...</signal>\n\nSlow mode:\n<perception>...</perception>\n<mode>slow</mode>\n<reasoning>...</reasoning>\n<current_v>...</current_v>\n<signal>...</signal>\n\nDo not output any text before the first tag or after the last tag.\nDo not omit, rename, or reorder any tag required by the selected mode.\nDo not use markdown code fences.\n"}]
+                "Your response must use exactly one of these valid layouts:\n\nFast mode:\n<perception>...</perception>\n<mode>fast</mode>\n<signal>...</signal>\n\nSlow mode:\n<perception>...</perception>\n<mode>slow</mode>\n<reasoning>...</reasoning>\n<signal>...</signal>\n\nDo not output any text before the first tag or after the last tag.\nDo not omit, rename, or reorder any tag required by the selected mode.\nDo not use markdown code fences.\n"}]
     def background_actions(self, snapshot_id): return {"intersection_1_1":"NTST","intersection_2_1":"NTST"}
     def execute_cycle(self, actions, seconds): return {"actions":actions,"seconds":seconds}
     def local_reward(self, focal_id, receiver_ids, result): return float(len(receiver_ids))

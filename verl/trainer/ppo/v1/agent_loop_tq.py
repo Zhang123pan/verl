@@ -193,6 +193,46 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
             ).squeeze(0)
 
+            perception_sft_fields = {}
+            perception_sft_coef = float(os.environ.get("V35_PERCEPTION_SFT_COEF", "0"))
+            if perception_sft_coef > 0.0 and not validate:
+                from v35_offline_grpo.perception_sft import build_grpo_loss_mask, build_perception_target
+
+                target_text = build_perception_target(kwargs.get("reward_model"), kwargs.get("raw_prompt"))
+                target_ids = self.tokenizer.encode(target_text, add_special_tokens=False)
+                if len(target_ids) > self.config.actor_rollout_ref.rollout.response_length:
+                    sample_id = kwargs.get("index", "unknown")
+                    raise ValueError(
+                        f"perception SFT target for {sample_id} has {len(target_ids)} tokens, "
+                        f"exceeding response_length={self.config.actor_rollout_ref.rollout.response_length}"
+                    )
+
+                perception_responses = torch.tensor(target_ids, dtype=torch.int64)
+                perception_mask = torch.ones_like(perception_responses, dtype=torch.int64)
+                perception_input_ids = torch.cat([prompts, perception_responses], dim=0)
+                perception_attention_mask = torch.ones_like(perception_input_ids, dtype=torch.int64)
+                perception_position_ids = self._compute_position_ids(
+                    perception_input_ids.unsqueeze(0),
+                    perception_attention_mask.unsqueeze(0),
+                    dict(multi_modal_inputs),
+                ).squeeze(0)
+                grpo_loss_mask = torch.tensor(
+                    build_grpo_loss_mask(output.response_ids, self.tokenizer), dtype=torch.int64
+                )
+                grpo_loss_mask *= torch.tensor(output.response_mask, dtype=torch.int64)
+                perception_sft_fields = {
+                    "grpo_loss_mask": grpo_loss_mask,
+                    "perception_sft_responses": perception_responses,
+                    "perception_sft_input_ids": perception_input_ids,
+                    "perception_sft_attention_mask": perception_attention_mask,
+                    "perception_sft_position_ids": perception_position_ids,
+                    "perception_sft_mask": perception_mask,
+                }
+
+            # Processor-only multimodal metadata is needed for M-RoPE above,
+            # but should not be forwarded to the model.
+            multi_modal_inputs.pop("mm_token_type_ids", None)
+
             keys.append(f"{uid}_{session_id}_{i}")
             field = output.as_dict()
             field.update(kwargs)
@@ -203,6 +243,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["input_ids"] = input_ids
             field["position_ids"] = position_ids
             field["multi_modal_inputs"] = multi_modal_inputs
+            field.update(perception_sft_fields)
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
             tags.append(

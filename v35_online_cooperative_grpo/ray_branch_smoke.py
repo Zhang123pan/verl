@@ -52,9 +52,9 @@ def main() -> None:
             ])
             requests = []
             for snapshot in snapshots:
-                # All intersections receive one valid canonical phase. Real
-                # policy actions replace this table after vLLM integration.
-                actions = {inter_id: "ETWT" for inter_id in configs[snapshot.city]["INTER_PHASE_MAPPING"]}
+                if not snapshot.background_actions:
+                    raise RuntimeError(f"Snapshot {snapshot.snapshot_id} has no V25 background actions")
+                actions = dict(snapshot.background_actions)
                 for branch_id in range(rollout_n):
                     requests.append((snapshot, actions, branch_id))
 
