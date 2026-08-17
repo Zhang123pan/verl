@@ -17,7 +17,11 @@ import torch
 
 from verl.protocol import DataProto
 from verl.trainer.ppo.core_algos import AdvantageEstimator
-from verl.trainer.ppo.v1.utils import compute_advantage, compute_advantage_for_multi_trajectories
+from verl.trainer.ppo.v1.utils import (
+    apply_cooperative_advantages,
+    compute_advantage,
+    compute_advantage_for_multi_trajectories,
+)
 
 
 @pytest.fixture
@@ -84,3 +88,25 @@ def test_compute_advantage_for_multi_trajectories(batch_data: DataProto):
     )
     assert torch.equal(result.batch["advantages"], adv_expected)
     assert torch.equal(result.batch["returns"], adv_expected)
+
+
+def test_apply_cooperative_advantages_broadcasts_each_span(batch_data: DataProto):
+    values = torch.tensor([1.5, 1.5, -0.5, -0.5, 0.0, 2.0])
+    batch_data.batch["cooperative_advantage"] = values
+
+    assert apply_cooperative_advantages(batch_data)
+    expected = values.unsqueeze(-1) * batch_data.batch["response_mask"]
+    assert torch.equal(batch_data.batch["advantages"], expected)
+    assert torch.equal(batch_data.batch["returns"], expected)
+
+
+def test_apply_cooperative_advantages_ignores_ordinary_batch(batch_data: DataProto):
+    batch_data.batch["cooperative_advantage"] = torch.full((len(batch_data),), float("nan"))
+    assert not apply_cooperative_advantages(batch_data)
+    assert "advantages" not in batch_data.batch
+
+
+def test_apply_cooperative_advantages_rejects_mixed_batch(batch_data: DataProto):
+    batch_data.batch["cooperative_advantage"] = torch.tensor([1.0, float("nan"), 1.0, 1.0, 1.0, 1.0])
+    with pytest.raises(ValueError, match="cannot mix cooperative"):
+        apply_cooperative_advantages(batch_data)

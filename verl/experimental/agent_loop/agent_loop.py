@@ -130,6 +130,16 @@ class AgentLoopOutput(BaseModel):
         if response_logprobs is not None:
             output["rollout_log_probs"] = torch.tensor(response_logprobs, dtype=torch.float32)
 
+        # Cooperative rollouts normalize rewards at branch level, then assign the
+        # same scalar advantage to the sender and every routed receiver span.
+        # NaN is an explicit sentinel for ordinary rollouts, which must keep using
+        # the configured UID-based advantage estimator.
+        cooperative_advantage = output["extra_fields"].pop("cooperative_advantage", None)
+        output["cooperative_advantage"] = torch.tensor(
+            float("nan") if cooperative_advantage is None else float(cooperative_advantage),
+            dtype=torch.float32,
+        )
+
         routed_experts = output.pop("routed_experts", None)
         if routed_experts is not None:
             routed_experts = torch.tensor(routed_experts, dtype=torch.int64)

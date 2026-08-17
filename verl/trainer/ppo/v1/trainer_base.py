@@ -72,7 +72,11 @@ from verl.trainer.ppo.utils import (
     need_teacher_policy,
 )
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY, ReplayBuffer, ReplayBufferAsync
-from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
+from verl.trainer.ppo.v1.utils import (
+    MetricsAggregator,
+    apply_cooperative_advantages,
+    compute_advantage_for_multi_trajectories,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.config import omega_conf_to_dataclass
@@ -1726,7 +1730,16 @@ class PPOTrainer(ABC):
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
-        fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        fields = [
+            "uid",
+            "response_mask",
+            "rm_scores",
+            "rollout_log_probs",
+            "old_log_probs",
+            "ref_log_prob",
+            "values",
+            "cooperative_advantage",
+        ]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         response_mask = data["response_mask"]
@@ -1756,16 +1769,22 @@ class PPOTrainer(ABC):
             metrics.update(is_metrics)
 
         # 3. compute advantages
-        data = compute_advantage_for_multi_trajectories(
-            data,
-            batch_keys=batch.keys,
-            adv_estimator=self.config.algorithm.adv_estimator,
-            gamma=self.config.algorithm.gamma,
-            lam=self.config.algorithm.lam,
-            num_repeat=self.config.actor_rollout_ref.rollout.n,
-            norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
-            config=self.config.algorithm,
-        )
+        cooperative_batch = apply_cooperative_advantages(data)
+        if cooperative_batch:
+            if self.config.algorithm.use_kl_in_reward:
+                raise ValueError("cooperative precomputed advantages require algorithm.use_kl_in_reward=false")
+            metrics["cooperative/precomputed_advantage"] = 1.0
+        else:
+            data = compute_advantage_for_multi_trajectories(
+                data,
+                batch_keys=batch.keys,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                config=self.config.algorithm,
+            )
 
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]

@@ -145,6 +145,29 @@ class MetricsAggregator:
         self.step_count = 0
 
 
+def apply_cooperative_advantages(data: DataProto) -> bool:
+    """Broadcast pre-normalized branch advantages over each policy span.
+
+    Returns ``False`` for ordinary batches marked entirely with NaN. Mixing
+    cooperative and ordinary spans in one optimizer batch is rejected because
+    they use different normalization units.
+    """
+    values = data.batch.get("cooperative_advantage")
+    if values is None:
+        return False
+    values = values.reshape(-1)
+    present = torch.isfinite(values)
+    if not present.any():
+        return False
+    if not present.all():
+        raise ValueError("cannot mix cooperative and ordinary spans in one advantage batch")
+    response_mask = data.batch["response_mask"]
+    advantages = values.to(response_mask.device, dtype=torch.float32).unsqueeze(-1) * response_mask
+    data.batch["advantages"] = advantages
+    data.batch["returns"] = advantages.clone()
+    return True
+
+
 def compute_advantage_for_multi_trajectories(
     data: DataProto,
     batch_keys: list[str],
